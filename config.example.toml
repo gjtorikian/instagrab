@@ -1,0 +1,30 @@
+# instagrab config
+
+# CDP endpoint of the long-lived Chrome service.
+browser_url = "http://127.0.0.1:9222"
+
+# JSONL file. Each run appends one line per username plus any alert lines.
+output_path = "/var/lib/instagrab/runs.jsonl"
+
+# Per-run sleep between profiles, in seconds (uniform random in [min, max]).
+jitter_min_secs = 30
+jitter_max_secs = 75
+
+# Per-username navigation/wait budget.
+nav_timeout_sec = 20
+
+# Only keep recent_posts whose taken_at_timestamp falls within the last N days.
+# 0 disables the filter. With time_window_days > 0, instagrab also paginates
+# (scrolls the profile grid) past the initial 12 posts until the oldest
+# captured post is older than the window.
+time_window_days = 7
+
+# Safety cap on pagination scrolls per profile. Each iteration is ~2.5s.
+max_scrolls = 8
+
+# If set, download each kept post's display_url to <images_dir>/<username>/<shortcode>.jpg.
+# Idempotent: existing files are kept. Empty string disables image download.
+images_dir = "./images"
+
+# Profiles to scrape. Leading @ is allowed and stripped.
+usernames = ["inch.press"]

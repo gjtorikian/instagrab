@@ -1,0 +1,198 @@
+{
+  "projectName": "Instagrab Friends Fan-out Library",
+  "slug": "instagrab-fanout",
+  "date": "2026-07-23",
+  "status": "Draft",
+  "supersedes": null,
+  "gates": {
+    "dimensions": [
+      {
+        "key": "problem",
+        "label": "Problem Clarity",
+        "status": "ready",
+        "evidence": "The brain dump plus answers define a concrete goal: a personal home-lab image wall showing recent posts from a curated set of one seed profile's Following, served to a website UI through a reusable FFI library, built conservatively to protect a real cookie-jar account."
+      },
+      {
+        "key": "goals",
+        "label": "Goal Definition",
+        "status": "ready",
+        "evidence": "Seven measurable goals are stated, each with an observable change (FFI-callable, zero friendship-endpoint calls on normal runs, off-by-default harvest, carousel/video flags, panic-safe boundary, a library-enforced pacing floor, and the CLI exit-code contract preserved)."
+      },
+      {
+        "key": "criteria",
+        "label": "Success Criteria",
+        "status": "ready",
+        "evidence": "Ten pass/fail criteria, each carrying a runnable check: cargo build/test, an offline FFI smoke that never touches live Instagram, a lexical guard isolating the friendship endpoint to one file, panic-safety and exit-code tests, a pacing-floor test, and cargo fmt --check + clippy."
+      },
+      {
+        "key": "scope",
+        "label": "Scope Boundaries",
+        "status": "ready",
+        "evidence": "Explicit in-scope, out-of-scope, and future lists were locked across five interview decisions and refined by the plan critics (consumer-side cache, library-side pacing floor, hand-written header at MVP)."
+      },
+      {
+        "key": "consistency",
+        "label": "Consistency",
+        "status": "ready",
+        "evidence": "The conservative-cookie-jar vs fan-out tension is resolved inside the library: a cached list plus a rare opt-in harvest keep normal runs off the friendship endpoint, and a Session-enforced minimum inter-scrape pacing floor means account safety does not depend on the out-of-scope caller's loop."
+      }
+    ]
+  },
+  "problem": [
+    "instagrab today is a one-shot CLI that scrapes a flat list of Instagram usernames and writes JSONL. The user is building a separate website UI (any language, on their home lab) that needs to show a wall of recent images from the people one seed profile follows — and it needs to drive the scraper on demand, per friend, not just read a nightly file. The current binary can't be called from another process, only run.",
+    "Two capabilities are missing outright. First, the code reads only follower/following counts, never the actual member list, so there is no way to discover who to fan out over. Second, that member list can only come from Instagram's private friendship endpoints, which 2025-26 enforcement treats as a top ban trigger — and the whole project's design ethos is to protect a real logged-in account. The design must add friends-list discovery and per-friend fan-out without turning normal runs into the exact request pattern that gets accounts suspended, and without letting account safety depend on an out-of-scope caller pacing its own loop."
+  ],
+  "goals": [
+    "Expose instagrab as a C-ABI library so a web service in any language can drive it over FFI: a caller can connect, scrape one username, receive valid JSON, free it, and disconnect without crashing.",
+    "A normal fan-out run makes zero calls to the friendship endpoints — only web_profile_info and the post feed — producing one JSON result per reachable friend with posts limited to the rolling last-N-days window.",
+    "Provide friends-list discovery as a separate, off-by-default harvest call that pages the seed's Following once at human pace and returns the usernames; persisting them is the consumer's job.",
+    "Flag carousels and videos in each post's output (media_count, has_video) so the UI can badge a post and link out to Instagram, while only the first image is downloaded.",
+    "Make the FFI boundary panic-safe: any error crosses as an error JSON payload, never as a process-aborting panic.",
+    "Enforce a minimum inter-scrape pacing floor inside the library so a naive caller loop cannot exceed a safe request rate — account safety lives in the brain, not the caller.",
+    "Preserve the existing CLI's cron behavior and exit-code contract (0 OK, 1 config, 2 logged_out, 3 schema_drift, 4 browser, 5 canary_failed), now built on top of the library."
+  ],
+  "successCriteria": [
+    {
+      "criterion": "The crate builds as a cdylib for FFI consumers.",
+      "check": "cargo build --release produces the cdylib (libinstagrab.dylib on macOS, libinstagrab.so on Linux) — exits 0"
+    },
+    {
+      "criterion": "A non-Rust caller compiles against the checked-in C header and drives the FFI lifecycle offline, with no live Instagram request.",
+      "check": "scripts/ffi-smoke compiles/links against include/instagrab.h, then connect (to an unreachable browser_url) returns an error JSON, free, and disconnect — exits 0; no CDP/Instagram traffic required"
+    },
+    {
+      "criterion": "New parser behavior for media flags is covered by tests.",
+      "check": "cargo test passes, including new tests for carousel/media_count and has_video from fixtures — exits 0"
+    },
+    {
+      "criterion": "The harvest path parses a friendship page into a username list, and the consumer-side cache round-trips.",
+      "check": "cargo test covering the friendship-page parser and the cache write/read round-trip — exits 0"
+    },
+    {
+      "criterion": "Only src/harvest.rs references the friendship endpoint; no other file does.",
+      "check": "test \"$(grep -rl 'friendships/' src)\" = \"src/harvest.rs\" — the endpoint literal lives in exactly one file"
+    },
+    {
+      "criterion": "The library returns a typed, reported-not-fatal per-friend outcome for private/unreachable friends (the fan-out never aborts on one bad friend).",
+      "check": "cargo test on scrape_one's outcome mapping — private, not-found, and logged_out each yield a typed result, not an error that halts the loop — exits 0"
+    },
+    {
+      "criterion": "The tree stays formatted and lint-clean.",
+      "check": "cargo fmt --check && cargo clippy --all-targets -- -D warnings — exits 0"
+    },
+    {
+      "criterion": "The FFI boundary is panic-safe.",
+      "check": "cargo test ffi_panic_safety — an extern \"C\" call given a null/invalid handle or panic-forcing input returns an error JSON payload, not an abort — exits 0"
+    },
+    {
+      "criterion": "The CLI preserves its exit-code contract after the rewrite.",
+      "check": "./target/release/instagrab -config /nonexistent.toml; test $? -eq 1 — plus a unit test asserting the library-error to exit-code mapping covers all six codes — exits 0"
+    },
+    {
+      "criterion": "The Session enforces a minimum inter-scrape delay regardless of how fast the caller loops.",
+      "check": "cargo test pacing_floor — back-to-back scrape_one calls with a small configured floor are spaced at least that far apart (timing/logic assertion) — exits 0"
+    }
+  ],
+  "scope": {
+    "mvp": [
+      { "item": "Post output gains media_count / is_carousel / has_video flags; first image still the only download", "reason": "Directly serves the 'tell me if there's more, I'll go to IG' decision and is a small additive parser change" },
+      { "item": "src/harvest.rs: a dedicated module that pages the seed's Following once via the attached Chrome, parses the friendship page, and returns the usernames — the ONLY file referencing the friendship endpoint", "reason": "The only sanctioned-by-design way to discover the fan-out set (goal #3), quarantined so the ban-trigger code is a single-file lexical guard" },
+      { "item": "Consumer-side cache: harvest returns the list; the CLI persists it to a file and its fan-out mode reads it back (the library stays stateless between calls)", "reason": "Gives the cache a named reader while honoring decision #5 — persistence is a consumer concern, not library state" },
+      { "item": "CLI gains a fan-out mode that reads the cached friends list instead of config.usernames", "reason": "Makes the CLI a real consumer of the cache and the home-lab cron path for the fan-out" },
+      { "item": "Session enforces a minimum inter-scrape pacing floor (safe default, configurable)", "reason": "Account safety must not depend on the out-of-scope website pacing its own loop; the floor keeps a naive caller under a safe rate" },
+      { "item": "Public Rust library API (Session connect / harvest / scrape_one / disconnect) extracted from main.rs, with an explicit idle timeout and reconnectable dropped-connection errors", "reason": "The library is the whole point; the FFI layer wraps it, and caller-driven gaps between calls can be unbounded" },
+      { "item": "C-ABI FFI layer: extern \"C\" over an opaque handle, JSON in/out, catch_unwind, free_string, and a hand-written checked-in C header (include/instagrab.h)", "reason": "Goal #1 — callable from any language; a hand-written header is the minimum-viable artifact for ~6 functions" },
+      { "item": "CLI rewritten as a thin consumer of the library, preserving exit codes + JSONL + canary + jitter", "reason": "Goal #7 — cron keeps working" },
+      { "item": "scripts/ffi-smoke: a non-Rust caller exercising the FFI lifecycle offline (no live Instagram)", "reason": "Proves goal #1 mechanically without spending cookie-jar risk on every verification" }
+    ],
+    "full": [
+      { "item": "cbindgen-automated header generation wired into the build", "reason": "Keeps the C header in sync with the Rust FFI signatures instead of hand-editing" },
+      { "item": "Structured error JSON with a machine-readable code enum across the FFI boundary", "reason": "Lets the calling UI distinguish logged_out / not_found / network / stale-session without string matching" },
+      { "item": "Release pipeline emits the Linux .so (x86_64-unknown-linux-gnu) for the home-lab deploy target", "reason": "The current scripts/release cross-compiles a static musl binary and can't emit a loadable library" }
+    ],
+    "stretch": [],
+    "outOfScope": [
+      { "item": "The website / UI itself", "reason": "Separate project in the user's chosen language; instagrab is only the brain" },
+      { "item": "An HTTP / daemon layer", "reason": "User will FFI directly; no network service needed" },
+      { "item": "Downloading full carousels or video files", "reason": "User prefers to click through to Instagram; keeps home-lab storage/bandwidth small" },
+      { "item": "Harvesting the friends list on every run", "reason": "That per-run pagination is exactly the ban fingerprint the design avoids" },
+      { "item": "Using Instagram's official Graph API", "reason": "It does not return follower/following member lists for any account" }
+    ],
+    "future": [
+      "Convenience batch FFI call that loops the cached list internally for headless/cron callers (deferred; granular remains the primary surface)",
+      "Prune downloaded images that fall outside the rolling window",
+      "Harvest mutuals or followers (not just Following)",
+      "Opt-in per-run harvest for users who accept the risk"
+    ]
+  },
+  "decisions": [
+    {
+      "decision": "Discover friends via a cached list on disk, (re)built by a rare, explicit, off-by-default harvest",
+      "rejected": "Auto-fetching the Following list on every run (or hand-typing usernames only)",
+      "reason": "Instagram's friendship endpoints are the top ban trigger under 2025-26 enforcement; the followers dialog is just a UI over the same endpoint, so safety comes from rarity and human pacing, not from DOM-vs-endpoint. A cached list keeps normal runs off the endpoint entirely."
+    },
+    {
+      "decision": "Ship instagrab as a C-ABI FFI library callable from any language",
+      "rejected": "A Rust-only web service, or a long-running HTTP daemon",
+      "reason": "The user wants to FFI into the brain from a web service written in any language, keeping the site's language independent of Rust."
+    },
+    {
+      "decision": "Download only the first image per post, but flag carousels and videos in the output",
+      "rejected": "Downloading every carousel image and/or the video files",
+      "reason": "The user prefers to open Instagram directly for the full set; flagging keeps storage and bandwidth on the home lab small."
+    },
+    {
+      "decision": "Apply a rolling last-N-days window per friend, reusing the existing time_window_days",
+      "rejected": "A fixed [start, end] date range, or latest-page-only with no time filter",
+      "reason": "Matches the user's 'images for a set of time' and is already implemented per-profile in parse.rs."
+    },
+    {
+      "decision": "Expose granular, caller-driven FFI calls as the primary surface; the library stays stateless between calls and the caller owns the loop and resume",
+      "rejected": "A single batch call as the primary surface (a convenience batch call is deferred to future, not permanently rejected)",
+      "reason": "Granular calls give the UI per-friend progress and survive restarts, and they push fan-out loop state into the web service where it belongs."
+    },
+    {
+      "decision": "Enforce a minimum inter-scrape pacing floor inside the library (Session-level)",
+      "rejected": "Relying on the existing CLI jitter or on the out-of-scope caller to pace its own loop",
+      "reason": "Critic fix (hidden-dependency blocker): the existing jitter lives only in the CLI loop, but decision #5 hands the loop to the out-of-scope website — a naive UI loop would hammer IG at full speed. Putting the floor in the library keeps account safety in the brain regardless of caller behavior."
+    },
+    {
+      "decision": "Isolate the friendship-endpoint fetch in a dedicated src/harvest.rs module",
+      "rejected": "Adding harvest_following alongside the feed fetch in src/scraper.rs",
+      "reason": "Critic fix (success-criteria blocker): quarantining the endpoint literal to one file makes the 'normal runs never touch the friendship endpoint' guarantee a single-file lexical check (grep -rl), which a shared module could not provide."
+    },
+    {
+      "decision": "Keep all contract verification offline; the live FFI smoke against Instagram is a manual, deliberate dev step",
+      "rejected": "Making a live canary scrape a top-level pass/fail success criterion",
+      "reason": "Critic fix (hidden-dependency + scope-creep blockers): CLAUDE.md forbids integration tests against live IG because every run costs cookie-jar risk; an offline lifecycle smoke proves the FFI boundary without spending that risk on every verification."
+    }
+  ],
+  "execution": {
+    "strategy": "Sequential",
+    "phases": [
+      {
+        "title": "Capabilities: media flags, harvest, cache",
+        "risk": "medium",
+        "blocking": true,
+        "specPath": "docs/ideation/instagrab-fanout/spec-phase-1.md",
+        "notes": "Additive within the current architecture. parse.rs gains media_count/is_carousel/has_video. A NEW src/harvest.rs is the only file that references the friendship endpoint: it fetches and parses the seed's Following page and returns the usernames (no live-IG test — fixture-driven). A consumer-side cache helper writes/reads the friends list. All fixture-testable via cargo test."
+      },
+      {
+        "title": "Library extraction",
+        "risk": "medium",
+        "blocking": true,
+        "prereqs": ["Capabilities: media flags, harvest, cache"],
+        "specPath": "docs/ideation/instagrab-fanout/spec-phase-2.md",
+        "notes": "Create lib.rs exposing a Rust API (Session::connect / harvest / scrape_one / disconnect) with typed results and no process::exit. Session::connect takes or derives an explicit CDP idle timeout, and scrape_one on a dropped connection maps to a machine-readable, reconnectable error (caller-driven gaps between calls are unbounded). The Session enforces the minimum inter-scrape pacing floor. Split the crate into lib + bin; rewrite main.rs as a thin consumer preserving exit codes, JSONL, canary, jitter, and add the CLI fan-out mode that reads the cache."
+      },
+      {
+        "title": "C-ABI FFI + build",
+        "risk": "high",
+        "blocking": true,
+        "prereqs": ["Library extraction"],
+        "specPath": "docs/ideation/instagrab-fanout/spec-phase-3.md",
+        "notes": "Add ffi.rs: extern \"C\" functions over an opaque session handle, JSON marshaling, catch_unwind, free_string. Set Cargo crate-type to include cdylib. Hand-write and check in include/instagrab.h (cbindgen automation is deferred to Full). Add scripts/ffi-smoke (offline lifecycle, no live IG). The deploy target is a Linux x86_64-unknown-linux-gnu .so — spell out the concrete scripts/release change to emit it (the current static-musl pipeline copies only the binary and cannot emit a loadable library)."
+      }
+    ]
+  }
+}

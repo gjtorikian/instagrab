@@ -1,0 +1,14 @@
+/target/
+/instagrab*
+/instagrab-*
+/instagrab.exe
+/dist/
+*.log
+*.jsonl
+.DS_Store
+
+config.toml
+runs.jsonl
+
+scripts/upload
+images/

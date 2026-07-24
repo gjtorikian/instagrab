@@ -1,0 +1,35 @@
+[Unit]
+Description=Headless Chrome for instagrab (CDP on 127.0.0.1:9222)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=instagrab
+Group=instagrab
+
+# Pick whichever binary your distro provides.
+ExecStart=/usr/bin/google-chrome \
+  --headless=new \
+  --remote-debugging-port=9222 \
+  --remote-debugging-address=127.0.0.1 \
+  --user-data-dir=/var/lib/instagrab/CDPProfile \
+  --disable-gpu \
+  --no-first-run \
+  --no-default-browser-check \
+  --disable-background-networking \
+  --disable-features=Translate,InterestFeedContentSuggestions \
+  --window-size=1280,1800
+
+Restart=on-failure
+RestartSec=5s
+
+# Lock the listener to localhost via the flag above; this is belt-and-braces.
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/instagrab
+ProtectHome=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

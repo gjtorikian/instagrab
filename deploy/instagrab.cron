@@ -1,0 +1,4 @@
+# /etc/cron.d/instagrab
+# Daily scrape at 04:17. Off-round minute, weak signal against bot patterns.
+MAILTO=root
+17 4 * * *  instagrab  /usr/local/bin/instagrab -config /etc/instagrab/config.toml >> /var/log/instagrab.log 2>&1

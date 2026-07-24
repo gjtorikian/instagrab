@@ -1,0 +1,22 @@
+[package]
+name = "instagrab"
+version = "0.1.0"
+edition = "2021"
+description = "Scrapes Instagram profile metadata by attaching to a real Chrome over CDP"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+ctrlc = { version = "3", features = ["termination"] }
+fastrand = "2"
+headless_chrome = "1"
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+ureq = "2"
+
+[profile.release]
+strip = true
+lto = true
