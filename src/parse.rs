@@ -19,6 +19,12 @@ pub struct RecentPost {
     pub display_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub local_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub media_count: Option<i64>,
+    #[serde(skip_serializing_if = "is_false_opt")]
+    pub is_carousel: Option<bool>,
+    #[serde(skip_serializing_if = "is_false_opt")]
+    pub has_video: Option<bool>,
 }
 
 impl RecentPost {
@@ -32,6 +38,9 @@ impl RecentPost {
             taken_at_unix: None,
             display_url: None,
             local_path: None,
+            media_count: None,
+            is_carousel: None,
+            has_video: None,
         }
     }
 }
@@ -58,6 +67,10 @@ fn is_zero(n: &i64) -> bool {
 
 fn is_false(b: &bool) -> bool {
     !(*b)
+}
+
+fn is_false_opt(b: &Option<bool>) -> bool {
+    !matches!(b, Some(true))
 }
 
 /// One JSONL line per username
@@ -214,6 +227,10 @@ pub fn parse_web_profile_info(username: &str, raw: &[u8]) -> AnyResult<ParsedPro
                 .get("display_url")
                 .and_then(Value::as_str)
                 .map(String::from);
+            let (mc, carousel, hv) = media_facts_from_graphql_node(node);
+            rp.media_count = mc;
+            rp.is_carousel = carousel;
+            rp.has_video = hv;
             r.push_post(rp);
         }
     }
@@ -253,6 +270,36 @@ fn requires_login(doc: &Value) -> bool {
         }
     }
     false
+}
+
+/// Derives (media_count, is_carousel, has_video) from a web_profile_info
+/// timeline node. Carousels expose `edge_sidecar_to_children`; a node's own
+/// `is_video` covers single videos. Shape-tolerant — a missing sidecar
+/// degrades to a single image (count 1).
+fn media_facts_from_graphql_node(node: &Value) -> (Option<i64>, Option<bool>, Option<bool>) {
+    let top_is_video = node
+        .get("is_video")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if let Some(children) =
+        nav(node, &["edge_sidecar_to_children", "edges"]).and_then(Value::as_array)
+    {
+        let count = children.len() as i64;
+        let child_video = children.iter().any(|c| {
+            c.get("node")
+                .and_then(|n| n.get("is_video"))
+                .and_then(Value::as_bool)
+                == Some(true)
+        });
+        let hv = if top_is_video || child_video {
+            Some(true)
+        } else {
+            None
+        };
+        return (Some(count), Some(true), hv);
+    }
+    let hv = if top_is_video { Some(true) } else { None };
+    (Some(1), None, hv)
 }
 
 fn caption_from_node(node: &Value) -> Option<String> {
@@ -371,11 +418,39 @@ fn post_from_feed_item(it: &Value) -> Option<RecentPost> {
             rp.is_video = Some(true);
         }
     }
+    let (mc, carousel, hv) = media_facts_from_feed_item(it);
+    rp.media_count = mc;
+    rp.is_carousel = carousel;
+    rp.has_video = hv;
     let u = best_image_url(it);
     if !u.is_empty() {
         rp.display_url = Some(u);
     }
     Some(rp)
+}
+
+/// Derives (media_count, is_carousel, has_video) from a mobile-feed item.
+/// media_type: 1=image, 2=video, 8=carousel. Shape-tolerant — a missing
+/// media_type or carousel_media degrades to a single image (count 1).
+fn media_facts_from_feed_item(it: &Value) -> (Option<i64>, Option<bool>, Option<bool>) {
+    if let Some(cm) = it.get("carousel_media").and_then(Value::as_array) {
+        let count = cm.len() as i64;
+        let has_video = cm.iter().any(|c| {
+            c.get("media_type")
+                .and_then(Value::as_f64)
+                .map(|f| f as i64)
+                == Some(2)
+        });
+        let hv = if has_video { Some(true) } else { None };
+        return (Some(count), Some(true), hv);
+    }
+    let top_is_video = it
+        .get("media_type")
+        .and_then(Value::as_f64)
+        .map(|f| f as i64)
+        == Some(2);
+    let hv = if top_is_video { Some(true) } else { None };
+    (Some(1), None, hv)
 }
 
 /// Pulls the highest-width candidate from image_versions2. Falls back into
@@ -551,6 +626,76 @@ mod tests {
         assert_eq!(b.shortcode, "BBB");
         assert_eq!(b.is_video, None);
         assert_eq!(b.display_url.as_deref(), Some("https://x/c.jpg"));
+    }
+
+    #[test]
+    fn media_flags_from_feed() {
+        let raw = br#"{
+          "items": [
+            {"code": "IMG", "media_type": 1,
+             "image_versions2": {"candidates": [{"url": "https://x/i.jpg", "width": 640}]}},
+            {"code": "VID", "media_type": 2,
+             "image_versions2": {"candidates": [{"url": "https://x/v.jpg", "width": 640}]}},
+            {"code": "CAR", "media_type": 8, "carousel_media": [
+              {"code": "CAR", "media_type": 1, "image_versions2": {"candidates": [{"url": "https://x/1.jpg", "width": 640}]}},
+              {"code": "CAR", "media_type": 2, "image_versions2": {"candidates": [{"url": "https://x/2.jpg", "width": 640}]}},
+              {"code": "CAR", "media_type": 1, "image_versions2": {"candidates": [{"url": "https://x/3.jpg", "width": 640}]}}
+            ]}
+          ],
+          "more_available": false,
+          "next_max_id": ""
+        }"#;
+        let page = parse_user_feed(raw).unwrap();
+        assert_eq!(page.posts.len(), 3);
+
+        let img = &page.posts[0];
+        assert_eq!(img.media_count, Some(1));
+        assert_eq!(img.is_carousel, None);
+        assert_eq!(img.has_video, None);
+
+        let vid = &page.posts[1];
+        assert_eq!(vid.media_count, Some(1));
+        assert_eq!(vid.is_carousel, None);
+        assert_eq!(vid.has_video, Some(true));
+        assert_eq!(vid.is_video, Some(true));
+
+        let car = &page.posts[2];
+        assert_eq!(car.media_count, Some(3));
+        assert_eq!(car.is_carousel, Some(true));
+        assert_eq!(car.has_video, Some(true));
+    }
+
+    #[test]
+    fn media_flags_from_graphql() {
+        let raw = br#"{
+          "data": {"user": {
+            "id": "1", "username": "u",
+            "edge_followed_by": {"count": 0}, "edge_follow": {"count": 0},
+            "edge_owner_to_timeline_media": {"count": 3, "edges": [
+              {"node": {"shortcode": "IMG", "is_video": false}},
+              {"node": {"shortcode": "VID", "is_video": true}},
+              {"node": {"shortcode": "CAR", "is_video": false,
+                "edge_sidecar_to_children": {"edges": [
+                  {"node": {"is_video": false}},
+                  {"node": {"is_video": true}}
+                ]}}}
+            ]}
+          }}
+        }"#;
+        let p = parse_web_profile_info("u", raw).unwrap();
+        let posts = p.result.unwrap().recent_posts.unwrap();
+        assert_eq!(posts.len(), 3);
+
+        assert_eq!(posts[0].media_count, Some(1));
+        assert_eq!(posts[0].is_carousel, None);
+        assert_eq!(posts[0].has_video, None);
+
+        assert_eq!(posts[1].media_count, Some(1));
+        assert_eq!(posts[1].has_video, Some(true));
+
+        assert_eq!(posts[2].media_count, Some(2));
+        assert_eq!(posts[2].is_carousel, Some(true));
+        assert_eq!(posts[2].has_video, Some(true));
     }
 
     #[test]

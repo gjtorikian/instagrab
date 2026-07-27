@@ -1,13 +1,16 @@
-//! TOML loader + write_example for -write-sample-config.
+//! TOML loader + write_example for --write-sample-config.
 
 use anyhow::{anyhow, bail, Result};
 use serde::Deserialize;
 use std::fs;
+use std::path::Path;
 
 #[derive(Deserialize, Default, Debug)]
 #[serde(default)]
 pub struct Config {
     pub browser_url: String,
+    /// The one output directory. instagrab writes everything under it:
+    /// <output_path>/runs.jsonl, <output_path>/images/, <output_path>/friends.txt.
     pub output_path: String,
     pub usernames: Vec<String>,
     pub jitter_min_secs: i64,
@@ -17,8 +20,8 @@ pub struct Config {
     pub time_window_days: i64,
     /// safety cap on pagination
     pub max_scrolls: i64,
-    /// empty = don't download
-    pub images_dir: String,
+    /// Seed profile whose Following `--fetch-follows` pages (or pass `--seed`).
+    pub seed_username: String,
 }
 
 pub fn load(path: &str) -> Result<Config> {
@@ -48,6 +51,30 @@ impl Config {
         }
     }
 
+    /// The JSONL scan output file, `<output_path>/runs.jsonl`.
+    pub fn jsonl_path(&self) -> String {
+        Path::new(&self.output_path)
+            .join("runs.jsonl")
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// The image download root, `<output_path>/images`.
+    pub fn images_path(&self) -> String {
+        Path::new(&self.output_path)
+            .join("images")
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// The follows list, `<output_path>/friends.txt`.
+    pub fn friends_path(&self) -> String {
+        Path::new(&self.output_path)
+            .join("friends.txt")
+            .to_string_lossy()
+            .into_owned()
+    }
+
     fn validate(&mut self) -> Result<()> {
         if self.output_path.is_empty() {
             bail!("output_path is required");
@@ -75,42 +102,45 @@ impl Config {
 
 pub fn write_example(path: &str) -> Result<()> {
     const SAMPLE: &str = r#"# instagrab config
+#
+# Two commands share this file:
+#   instagrab --fetch-follows  -> page seed_username's Following, write friends.txt (run rarely, e.g. monthly)
+#   instagrab                  -> scan everyone in friends.txt, write runs.jsonl + images (run daily)
 
 # CDP endpoint of the long-lived Chrome service.
 browser_url = "http://127.0.0.1:9222"
 
-# JSONL file. Each run appends one line per username plus any alert lines.
-output_path = "/var/lib/instagrab/runs.jsonl"
+# The one output directory. instagrab writes everything under it — point your UI here:
+#   <output_path>/runs.jsonl                     scan output (one JSON line per profile)
+#   <output_path>/images/<user>/<shortcode>.jpg  first image per in-window post
+#   <output_path>/friends.txt                    the follows list (--fetch-follows writes, scan reads)
+output_path = "/var/lib/instagrab"
 
+# Seed profile whose Following `instagrab --fetch-follows` pages (or pass --seed <name>).
+# Fetching the list touches Instagram's friendship endpoint, so run it rarely.
+seed_username = "your_handle"
+
+# Only keep posts whose timestamp falls within the last N days (0 = no filter).
+# With time_window_days > 0, the scan also pages the feed until the oldest
+# captured post is older than the window.
+time_window_days = 90
+
+# --- Anti-detection / tuning (defaults shown; usually leave these) ---
 # Per-run sleep between profiles, in seconds (uniform random in [min, max]).
 jitter_min_secs = 30
 jitter_max_secs = 75
-
-# Per-username navigation/wait budget.
+# Per-profile navigation/wait budget.
 nav_timeout_sec = 20
-
-# Only keep recent_posts whose taken_at_timestamp falls within the last N days.
-# 0 disables the filter. With time_window_days > 0, instagrab also paginates
-# (scrolls the profile grid) past the initial 12 posts until the oldest
-# captured post is older than the window.
-time_window_days = 7
-
-# Safety cap on pagination scrolls per profile. Each iteration is ~2.5s.
+# Safety cap on feed pages per profile.
 max_scrolls = 8
 
-# If set, download each kept post's display_url to <images_dir>/<username>/<shortcode>.jpg.
-# Idempotent: existing files are kept. Empty string disables image download.
-images_dir = ""
+# A canary scrape against instagram.com/instagram runs before each scan. Zero
+# posts without a logged_out signal emits a "canary_failed" alert and exits 5.
+# Always on; no knob.
 
-# A canary scrape against instagram.com/instagram runs before each batch.
-# If it comes back with zero posts and no logged_out signal, we emit a
-# "canary_failed" alert and exit 5 — distinguishes "IG broke" from "this
-# user is private". No config knob; the canary is always on.
-
-# Profiles to scrape. Leading @ is allowed and stripped.
-usernames = [
-  "gjtorikian",
-]
+# Fixed scrape list, used only as a fallback when the follows file is empty.
+# Leading @ is allowed and stripped. For the follows-list workflow, leave empty.
+# usernames = ["gjtorikian"]
 "#;
     fs::write(path, SAMPLE)?;
     Ok(())
@@ -151,6 +181,18 @@ usernames = ["@zuck", "  ", "plain", "@"]
         fs::write(&p, "usernames = []\n").unwrap();
         let err = load(p.to_str().unwrap()).unwrap_err();
         assert_eq!(err.to_string(), "output_path is required");
+    }
+
+    #[test]
+    fn output_path_derives_subpaths() {
+        let dir = std::env::temp_dir().join("instagrab-config-test");
+        fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("od.toml");
+        fs::write(&p, "output_path = \"/var/lib/ig\"\n").unwrap();
+        let c = load(p.to_str().unwrap()).unwrap();
+        assert_eq!(c.jsonl_path(), "/var/lib/ig/runs.jsonl");
+        assert_eq!(c.images_path(), "/var/lib/ig/images");
+        assert_eq!(c.friends_path(), "/var/lib/ig/friends.txt");
     }
 
     #[test]

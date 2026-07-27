@@ -91,8 +91,8 @@ Manual smoke test:
 
 ```sh
 sudo -u instagrab /usr/local/bin/instagrab \
-  -config /etc/instagrab/config.toml \
-  -once <your-handle>
+  --config /etc/instagrab/config.toml \
+  --once <your-handle>
 
 tail -1 /var/lib/instagrab/runs.jsonl   # one JSON line
 ```
@@ -102,6 +102,9 @@ Wire cron:
 ```sh
 install -m 0644 deploy/instagrab.cron /etc/cron.d/instagrab
 ```
+
+Two entries: the daily scan (04:17) and a monthly `--fetch-follows` refresh
+(03:23 on the 1st), staggered so the two never share the one Chrome session.
 
 ## 6. Operational notes
 

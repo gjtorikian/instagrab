@@ -1,6 +1,8 @@
 //! Flag parsing, orchestration, alert + exit codes, canary.
 
+mod cache;
 mod config;
+mod follows;
 mod images;
 mod output;
 mod parse;
@@ -31,6 +33,47 @@ struct Flags {
     write_sample: String,
     dry_run: bool,
     debug: bool,
+    fetch_follows: bool,
+    seed: String,
+    limit: i64,
+}
+
+/// Resolves the scan list: an explicit `--once` username wins; otherwise the
+/// follows file (already read into `follows`); if that's empty, the config
+/// `usernames` fallback. `limit > 0` caps the list to that many profiles — the
+/// caller orders the follows file stalest-first, so a limit scans the oldest N.
+/// Pure so it can be unit-tested.
+fn scan_list(
+    one_shot: &str,
+    follows: Vec<String>,
+    usernames: &[String],
+    limit: i64,
+) -> Vec<String> {
+    let mut list = if !one_shot.is_empty() {
+        vec![one_shot.to_string()]
+    } else if !follows.is_empty() {
+        follows
+    } else {
+        usernames.to_vec()
+    };
+    if limit > 0 && (limit as usize) < list.len() {
+        list.truncate(limit as usize);
+    }
+    list
+}
+
+/// The post-loop exit code. Preserves the documented precedence: a logged_out
+/// signal (2) outranks schema drift (3), and drift only fires when it hit every
+/// successful result this run. Canary/config/browser codes (5/1/4) are decided
+/// earlier via direct process::exit and are not routed through here.
+fn exit_for(logged_out_seen: bool, drift_count: i64, results_this_run: i64) -> i32 {
+    if logged_out_seen {
+        return EXIT_LOGGED_OUT;
+    }
+    if drift_count > 0 && drift_count == results_this_run {
+        return EXIT_SCHEMA_DRIFT;
+    }
+    EXIT_OK
 }
 
 fn main() {
@@ -59,7 +102,7 @@ fn main() {
         }
     };
 
-    let mut out = match output::open(&cfg.output_path) {
+    let mut out = match output::open(&cfg.jsonl_path()) {
         Ok(o) => o,
         Err(e) => {
             logln(&format!("open output: {e}"));
@@ -92,13 +135,24 @@ fn main() {
         return;
     }
 
-    let usernames: Vec<String> = if !flags.one_shot.is_empty() {
-        vec![flags.one_shot.clone()]
+    if flags.fetch_follows {
+        run_fetch_follows(&s, &cfg, &flags, &mut out);
+        return;
+    }
+
+    let follows = if flags.one_shot.is_empty() {
+        cache::read_friends(&cfg.friends_path()).unwrap_or_else(|e| {
+            logln(&format!("read follows file: {e}"));
+            Vec::new()
+        })
     } else {
-        cfg.usernames.clone()
+        Vec::new()
     };
+    let usernames = scan_list(&flags.one_shot, follows, &cfg.usernames, flags.limit);
     if usernames.is_empty() {
-        logln("no usernames to scrape");
+        logln(
+            "no profiles to scan (run --fetch-follows to build the follows list, or set usernames)",
+        );
         return;
     }
 
@@ -106,11 +160,7 @@ fn main() {
     let mut drift_count = 0;
     let mut results_this_run = 0;
 
-    let image_dl = if !cfg.images_dir.is_empty() {
-        Some(images::new(&cfg.images_dir))
-    } else {
-        None
-    };
+    let image_dl = Some(images::new(&cfg.images_path()));
 
     let paginate_until: i64 = if cfg.time_window_days > 0 {
         chrono::Utc::now().timestamp() - cfg.time_window_days * 24 * 60 * 60
@@ -212,13 +262,10 @@ fn main() {
         }
     }
 
-    let mut exit_code = EXIT_OK;
-
     if logged_out_seen {
         let mut alert = new_alert("logged_out");
         alert.note = "re-run SSH-tunnel login bootstrap".to_string();
         let _ = out.write_json(&alert);
-        exit_code = EXIT_LOGGED_OUT;
     }
 
     // Schema-drift alert: only fire if drift hit on every successful result
@@ -228,14 +275,55 @@ fn main() {
         let mut alert = new_alert("schema_drift");
         alert.note = format!("expected paths missing on {drift_count}/{results_this_run} profiles");
         let _ = out.write_json(&alert);
-        if exit_code == EXIT_OK {
-            exit_code = EXIT_SCHEMA_DRIFT;
-        }
     }
 
+    let exit_code = exit_for(logged_out_seen, drift_count, results_this_run);
     if exit_code != EXIT_OK {
         process::exit(exit_code);
     }
+}
+
+/// The `--fetch-follows` action: page the seed's Following and (re)write the
+/// follows file the daily scan reads. Off by default; run it rarely. Exits the
+/// process on error/logged_out; returns normally on success (caller then returns
+/// from `main`).
+fn run_fetch_follows(s: &Scraper, cfg: &config::Config, flags: &Flags, out: &mut output::Writer) {
+    let seed = if !flags.seed.is_empty() {
+        flags.seed.clone()
+    } else {
+        cfg.seed_username.clone()
+    };
+    if seed.is_empty() {
+        logln("fetch-follows requires a seed (-seed <name> or config seed_username)");
+        process::exit(EXIT_CONFIG_ERROR);
+    }
+
+    let oc = s.fetch_follows(&seed, 0);
+    if oc.requires_login {
+        let mut alert = new_alert("logged_out");
+        alert.note =
+            "fetch-follows tripped logged_out; re-run SSH-tunnel login bootstrap".to_string();
+        alert.username = seed;
+        let _ = out.write_json(&alert);
+        process::exit(EXIT_LOGGED_OUT);
+    }
+    if let Some(e) = &oc.err {
+        logln(&format!("fetch-follows error: {e}"));
+        // No usernames at all means the fetch truly failed; a non-empty list
+        // with an error is a partial page (e.g. a 429 mid-pagination) worth keeping.
+        if oc.usernames.is_empty() {
+            process::exit(EXIT_BROWSER_ERROR);
+        }
+    }
+    if let Err(e) = cache::write_friends(&cfg.friends_path(), &oc.usernames) {
+        logln(&format!("fetch-follows write follows file: {e}"));
+        process::exit(EXIT_CONFIG_ERROR);
+    }
+    println!(
+        "fetched {} follows -> {}",
+        oc.usernames.len(),
+        cfg.friends_path()
+    );
 }
 
 /// Sleeps a uniform-random number of seconds in [lo, hi), interruptible by a
@@ -268,17 +356,24 @@ fn parse_flags() -> Result<Flags, String> {
         write_sample: String::new(),
         dry_run: false,
         debug: false,
+        fetch_follows: false,
+        seed: String::new(),
+        limit: 0,
     };
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
     while i < args.len() {
         let arg = args[i].clone();
-        // Accept both -flag and --flag, and -flag=value.
-        let stripped = arg
-            .strip_prefix("--")
-            .or_else(|| arg.strip_prefix('-'))
-            .ok_or_else(|| format!("unexpected argument: {arg}"))?;
+        // GNU-style flags only: --flag and --flag=value.
+        let stripped = match arg.strip_prefix("--") {
+            Some(s) => s,
+            None if arg.starts_with('-') => {
+                return Err(format!("unknown flag: {arg} (flags take two dashes, e.g. --{})\n{}",
+                    arg.trim_start_matches('-'), usage()));
+            }
+            None => return Err(format!("unexpected argument: {arg}\n{}", usage())),
+        };
         let (name, inline_val) = match stripped.split_once('=') {
             Some((n, v)) => (n.to_string(), Some(v.to_string())),
             None => (stripped.to_string(), None),
@@ -292,7 +387,7 @@ fn parse_flags() -> Result<Flags, String> {
             *i += 1;
             args.get(*i)
                 .cloned()
-                .ok_or_else(|| format!("flag needs an argument: -{name}"))
+                .ok_or_else(|| format!("flag needs an argument: --{name}"))
         };
 
         match name.as_str() {
@@ -301,10 +396,18 @@ fn parse_flags() -> Result<Flags, String> {
             "write-sample-config" => flags.write_sample = take_value(&mut i)?,
             "dry-run" => flags.dry_run = parse_bool_flag(inline_val.as_deref())?,
             "debug" => flags.debug = parse_bool_flag(inline_val.as_deref())?,
+            "fetch-follows" => flags.fetch_follows = parse_bool_flag(inline_val.as_deref())?,
+            "seed" => flags.seed = take_value(&mut i)?,
+            "limit" => {
+                let v = take_value(&mut i)?;
+                flags.limit = v
+                    .parse::<i64>()
+                    .map_err(|_| format!("invalid --limit value: {v}"))?;
+            }
             "help" | "h" => return Err(usage()),
             other => {
                 return Err(format!(
-                    "flag provided but not defined: -{other}\n{}",
+                    "flag provided but not defined: --{other}\n{}",
                     usage()
                 ))
             }
@@ -327,15 +430,73 @@ fn parse_bool_flag(inline: Option<&str>) -> Result<bool, String> {
 
 fn usage() -> String {
     "Usage of instagrab:\n\
-     \x20 -config string\n\
+     \x20 --config string\n\
      \x20\x20\x20\x20TOML config path (default \"/etc/instagrab/config.toml\")\n\
-     \x20 -debug\n\
+     \x20 --debug\n\
      \x20\x20\x20\x20log fetch envelope + DOM facts to stderr per username\n\
-     \x20 -dry-run\n\
+     \x20 --dry-run\n\
      \x20\x20\x20\x20load config and connect to Chrome but don't scrape\n\
-     \x20 -once string\n\
-     \x20\x20\x20\x20scrape just this username, ignore config.usernames\n\
-     \x20 -write-sample-config string\n\
+     \x20 --fetch-follows\n\
+     \x20\x20\x20\x20page seed_username's Following, (re)write the follows file, then exit\n\
+     \x20 --seed string\n\
+     \x20\x20\x20\x20seed profile for --fetch-follows (overrides config seed_username)\n\
+     \x20 --once string\n\
+     \x20\x20\x20\x20scan just this username, ignore the follows list\n\
+     \x20 --limit int\n\
+     \x20\x20\x20\x20scan at most N profiles from the follows list (0 = no limit)\n\
+     \x20 --write-sample-config string\n\
      \x20\x20\x20\x20write an example config to PATH and exit"
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exit_code_contract_constants() {
+        // Documented cron/alerting contract — these values must not drift.
+        assert_eq!(EXIT_OK, 0);
+        assert_eq!(EXIT_CONFIG_ERROR, 1);
+        assert_eq!(EXIT_LOGGED_OUT, 2);
+        assert_eq!(EXIT_SCHEMA_DRIFT, 3);
+        assert_eq!(EXIT_BROWSER_ERROR, 4);
+        assert_eq!(EXIT_CANARY_FAILED, 5);
+    }
+
+    #[test]
+    fn exit_for_precedence() {
+        // logged_out (2) outranks schema drift (3).
+        assert_eq!(exit_for(true, 3, 3), EXIT_LOGGED_OUT);
+        // drift fires only when it hit every successful result this run.
+        assert_eq!(exit_for(false, 3, 3), EXIT_SCHEMA_DRIFT);
+        assert_eq!(exit_for(false, 2, 3), EXIT_OK);
+        assert_eq!(exit_for(false, 0, 0), EXIT_OK);
+    }
+
+    #[test]
+    fn scan_list_selection() {
+        let usernames = vec!["a".to_string(), "b".to_string()];
+        let follows = vec!["c".to_string(), "d".to_string(), "e".to_string()];
+
+        // --once wins over everything.
+        assert_eq!(
+            scan_list("zuck", follows.clone(), &usernames, 0),
+            vec!["zuck"]
+        );
+        // a non-empty follows file is used next.
+        assert_eq!(
+            scan_list("", follows.clone(), &usernames, 0),
+            vec!["c", "d", "e"]
+        );
+        // an empty follows file falls back to config usernames.
+        assert_eq!(scan_list("", Vec::new(), &usernames, 0), vec!["a", "b"]);
+        // limit caps the list (stalest-first ordering is the caller's job).
+        assert_eq!(
+            scan_list("", follows.clone(), &usernames, 2),
+            vec!["c", "d"]
+        );
+        // limit >= len is a no-op.
+        assert_eq!(scan_list("", follows, &usernames, 10), vec!["c", "d", "e"]);
+    }
 }

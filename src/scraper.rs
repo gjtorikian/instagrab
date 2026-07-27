@@ -67,11 +67,11 @@ impl Outcome {
 
 #[derive(Deserialize, Default)]
 #[serde(default)]
-struct FetchEnvelope {
-    status: i64,
-    url: String,
-    body: String,
-    error: String,
+pub(crate) struct FetchEnvelope {
+    pub(crate) status: i64,
+    pub(crate) url: String,
+    pub(crate) body: String,
+    pub(crate) error: String,
 }
 
 impl Scraper {
@@ -147,6 +147,129 @@ impl Scraper {
         let outcome = self.scrape_in_tab(&tab, username, opts);
         let _ = tab.close(false);
         outcome
+    }
+
+    /// Fetches the seed's Following usernames. Resolves the seed's numeric
+    /// user_id and the current app_id via the same profile fetch the scrape
+    /// path uses, then delegates paging to `crate::follows` (the only caller of
+    /// the private endpoint). Invoked only by the `-fetch-follows` command — never on
+    /// the normal scrape path.
+    pub fn fetch_follows(&self, seed: &str, max_pages: i64) -> crate::follows::FollowsOutcome {
+        use crate::follows::FollowsOutcome;
+        let tab = match self.browser.new_tab() {
+            Ok(t) => t,
+            Err(e) => {
+                return FollowsOutcome {
+                    err: Some(anyhow!("navigate: {e}")),
+                    ..Default::default()
+                }
+            }
+        };
+        let outcome = self.fetch_follows_in_tab(&tab, seed, max_pages);
+        let _ = tab.close(false);
+        outcome
+    }
+
+    fn fetch_follows_in_tab(
+        &self,
+        tab: &Tab,
+        seed: &str,
+        max_pages: i64,
+    ) -> crate::follows::FollowsOutcome {
+        use crate::follows::FollowsOutcome;
+        tab.set_default_timeout(self.nav_timeout);
+
+        let profile_url = format!("https://www.instagram.com/{seed}/");
+        let navigate = || -> Result<()> {
+            tab.navigate_to(&profile_url)?;
+            tab.wait_until_navigated()?;
+            tab.wait_for_element("body")?;
+            Ok(())
+        };
+        if let Err(e) = navigate() {
+            return FollowsOutcome {
+                err: Some(anyhow!("navigate: {e}")),
+                ..Default::default()
+            };
+        }
+        if let Ok(dom) = read_dom_facts(tab) {
+            if dom.is_login_page {
+                return FollowsOutcome {
+                    requires_login: true,
+                    ..Default::default()
+                };
+            }
+            if dom.not_found {
+                return FollowsOutcome {
+                    err: Some(anyhow!("seed profile not found: {seed}")),
+                    ..Default::default()
+                };
+            }
+        }
+
+        self.extract_app_id(tab);
+        let expr = format!(
+            "{}({}, {})",
+            FETCH_FN,
+            js_str(seed),
+            js_str(&self.current_app_id())
+        );
+        let env_json = match eval_string(tab, &expr, true) {
+            Ok(s) => s,
+            Err(e) => {
+                return FollowsOutcome {
+                    err: Some(anyhow!("fetch eval: {e}")),
+                    ..Default::default()
+                }
+            }
+        };
+        let env: FetchEnvelope = match serde_json::from_str(&env_json) {
+            Ok(e) => e,
+            Err(e) => {
+                return FollowsOutcome {
+                    err: Some(anyhow!("fetch envelope: {e}")),
+                    ..Default::default()
+                }
+            }
+        };
+        if env.status == 401 || env.status == 403 {
+            return FollowsOutcome {
+                requires_login: true,
+                ..Default::default()
+            };
+        }
+        if env.status >= 400 {
+            return FollowsOutcome {
+                err: Some(anyhow!("web_profile_info http {}", env.status)),
+                ..Default::default()
+            };
+        }
+
+        let parsed = match parse_web_profile_info(seed, env.body.as_bytes()) {
+            Ok(p) => p,
+            Err(e) => {
+                return FollowsOutcome {
+                    err: Some(anyhow!("parse: {e}")),
+                    ..Default::default()
+                }
+            }
+        };
+        if parsed.requires_login {
+            return FollowsOutcome {
+                requires_login: true,
+                ..Default::default()
+            };
+        }
+        let user_id = parsed.result.map(|r| r.user_id).unwrap_or_default();
+        if user_id.is_empty() {
+            return FollowsOutcome {
+                err: Some(anyhow!("no user_id for seed {seed}")),
+                ..Default::default()
+            };
+        }
+
+        // Human-paced paging: 4-8s between pages, capped by max_pages.
+        crate::follows::fetch_follows(tab, &user_id, &self.current_app_id(), max_pages, 4..9)
     }
 
     fn scrape_in_tab(&self, tab: &Tab, username: &str, opts: &ScrapeOpts) -> Outcome {
@@ -383,7 +506,7 @@ fn read_dom_facts(tab: &Tab) -> Result<DomRead> {
 
 /// Evaluates an expression and returns its string result. Non-string / absent
 /// values come back as ""
-fn eval_string(tab: &Tab, expr: &str, await_promise: bool) -> Result<String> {
+pub(crate) fn eval_string(tab: &Tab, expr: &str, await_promise: bool) -> Result<String> {
     let obj = tab.evaluate(expr, await_promise)?;
     Ok(obj
         .value
@@ -395,7 +518,7 @@ fn eval_string(tab: &Tab, expr: &str, await_promise: bool) -> Result<String> {
 }
 
 /// Quotes a string as a JavaScript/JSON string literal.
-fn js_str(s: &str) -> String {
+pub(crate) fn js_str(s: &str) -> String {
     serde_json::to_string(s).expect("string always serializes")
 }
 

@@ -1,4 +1,9 @@
 # /etc/cron.d/instagrab
 # Daily scrape at 04:17. Off-round minute, weak signal against bot patterns.
+# Monthly follows refresh on the 1st at 03:23 — scheduled well before the
+# daily scan so the two can never overlap (one Chrome, one logged-in session,
+# and cron provides no locking). --fetch-follows only pages the seed's
+# Following, so it finishes in minutes.
 MAILTO=root
-17 4 * * *  instagrab  /usr/local/bin/instagrab -config /etc/instagrab/config.toml >> /var/log/instagrab.log 2>&1
+23 3 1 * *  instagrab  /usr/local/bin/instagrab --config /etc/instagrab/config.toml --fetch-follows >> /var/log/instagrab.log 2>&1
+17 4 * * *  instagrab  /usr/local/bin/instagrab --config /etc/instagrab/config.toml >> /var/log/instagrab.log 2>&1
