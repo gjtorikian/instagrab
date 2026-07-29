@@ -369,8 +369,11 @@ fn parse_flags() -> Result<Flags, String> {
         let stripped = match arg.strip_prefix("--") {
             Some(s) => s,
             None if arg.starts_with('-') => {
-                return Err(format!("unknown flag: {arg} (flags take two dashes, e.g. --{})\n{}",
-                    arg.trim_start_matches('-'), usage()));
+                return Err(format!(
+                    "unknown flag: {arg} (flags take two dashes, e.g. --{})\n{}",
+                    arg.trim_start_matches('-'),
+                    usage()
+                ));
             }
             None => return Err(format!("unexpected argument: {arg}\n{}", usage())),
         };
@@ -409,7 +412,7 @@ fn parse_flags() -> Result<Flags, String> {
                 return Err(format!(
                     "flag provided but not defined: --{other}\n{}",
                     usage()
-                ))
+                ));
             }
         }
         i += 1;

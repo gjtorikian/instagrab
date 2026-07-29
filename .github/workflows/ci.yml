@@ -27,3 +27,18 @@ jobs:
         run: cargo build --verbose
       - name: cargo test
         run: cargo test --verbose
+
+  msrv:
+    name: build on MSRV
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Keep this pinned version in lockstep with `rust-version` in Cargo.toml.
+      # Edition 2024's floor is 1.85, but the locked dep tree (idna -> icu_*)
+      # needs 1.86; this job fails if a change pushes the real floor higher
+      # than the MSRV we publish to crates.io.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.86.0
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: cargo check --locked
+        run: cargo check --locked --verbose

@@ -1,6 +1,6 @@
 //! Append-only JSONL writer + Alert struct.
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use chrono::{SecondsFormat, Utc};
 use serde::Serialize;
 use std::fs::{self, File, OpenOptions};

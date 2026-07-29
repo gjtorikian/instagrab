@@ -2,7 +2,7 @@
 
 use crate::parse::ScrapeResult;
 use crate::shutdown;
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};

@@ -11,9 +11,9 @@
 //! by `parse_following_page` is provisional (see the spec's Open Item) and
 //! must be verified against a real capture during the manual fetch-follows test.
 
-use crate::scraper::{eval_string, js_str, FetchEnvelope};
+use crate::scraper::{FetchEnvelope, eval_string, js_str};
 use crate::shutdown;
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use headless_chrome::Tab;
 use serde::Deserialize;
 use serde_json::Value;

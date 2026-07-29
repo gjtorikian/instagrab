@@ -1,6 +1,6 @@
 //! TOML loader + write_example for --write-sample-config.
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{Result, anyhow, bail};
 use serde::Deserialize;
 use std::fs;
 use std::path::Path;

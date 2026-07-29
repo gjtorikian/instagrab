@@ -1,7 +1,7 @@
 //! web_profile_info / user-feed JSON -> Result, window filter, and the
 //! schema-drift detector (EXPECTED_PROFILE_PATHS).
 
-use anyhow::{anyhow, Result as AnyResult};
+use anyhow::{Result as AnyResult, anyhow};
 use chrono::{DateTime, Timelike, Utc};
 use serde::{Deserialize, Serialize, Serializer};
 use serde_json::Value;

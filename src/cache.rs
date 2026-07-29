@@ -5,7 +5,7 @@
 //! applies to `usernames`). The `-fetch-follows` command writes it; the daily scan
 //! reads it. Plain text (not JSON) so it stays trivially hand-editable.
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use std::collections::HashSet;
 use std::fs;
 use std::path::Path;

@@ -4,9 +4,9 @@
 //! headless_chrome's `evaluate` hardcodes returnByValue=false, so every
 //! in-page script here returns a *string* and we parse it out of RemoteObject.value.
 
-use crate::parse::{parse_user_feed, parse_web_profile_info, ScrapeResult};
+use crate::parse::{ScrapeResult, parse_user_feed, parse_web_profile_info};
 use crate::shutdown;
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use headless_chrome::{Browser, Tab};
 use regex::Regex;
 use serde::Deserialize;
@@ -162,7 +162,7 @@ impl Scraper {
                 return FollowsOutcome {
                     err: Some(anyhow!("navigate: {e}")),
                     ..Default::default()
-                }
+                };
             }
         };
         let outcome = self.fetch_follows_in_tab(&tab, seed, max_pages);
@@ -220,7 +220,7 @@ impl Scraper {
                 return FollowsOutcome {
                     err: Some(anyhow!("fetch eval: {e}")),
                     ..Default::default()
-                }
+                };
             }
         };
         let env: FetchEnvelope = match serde_json::from_str(&env_json) {
@@ -229,7 +229,7 @@ impl Scraper {
                 return FollowsOutcome {
                     err: Some(anyhow!("fetch envelope: {e}")),
                     ..Default::default()
-                }
+                };
             }
         };
         if env.status == 401 || env.status == 403 {
@@ -251,7 +251,7 @@ impl Scraper {
                 return FollowsOutcome {
                     err: Some(anyhow!("parse: {e}")),
                     ..Default::default()
-                }
+                };
             }
         };
         if parsed.requires_login {
