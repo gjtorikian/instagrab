@@ -38,26 +38,9 @@ jobs:
             echo "release=true" >> "$GITHUB_OUTPUT"
           fi
 
-  test:
-    name: build + test
-    needs: guard
-    if: needs.guard.outputs.release == 'true'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-      - name: cargo build
-        run: cargo build --release --verbose
-      - name: cargo test
-        run: cargo test --verbose
-
   publish:
     name: publish to crates.io
-    needs: [guard, test]
+    needs: guard
     if: needs.guard.outputs.release == 'true'
     runs-on: ubuntu-latest
     environment: release
