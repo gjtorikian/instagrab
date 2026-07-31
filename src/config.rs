@@ -104,7 +104,7 @@ pub fn write_example(path: &str) -> Result<()> {
     const SAMPLE: &str = r#"# instagrab config
 #
 # Two commands share this file:
-#   instagrab --fetch-follows  -> page seed_username's Following, write friends.txt (run rarely, e.g. monthly)
+#   instagrab --fetch-follows  -> page seed_username's Following, merge into friends.txt (run rarely, e.g. monthly)
 #   instagrab                  -> scan everyone in friends.txt, write runs.jsonl + images (run daily)
 
 # CDP endpoint of the long-lived Chrome service.
@@ -113,8 +113,13 @@ browser_url = "http://127.0.0.1:9222"
 # The one output directory. instagrab writes everything under it — point your UI here:
 #   <output_path>/runs.jsonl                     scan output (one JSON line per profile)
 #   <output_path>/images/<user>/<shortcode>.jpg  first image per in-window post
-#   <output_path>/friends.txt                    the follows list (--fetch-follows writes, scan reads)
+#   <output_path>/friends.txt                    the follows list (--fetch-follows merges, scan reads)
 output_path = "/var/lib/instagrab"
+
+# friends.txt is hand-editable and survives a harvest: --fetch-follows merges
+# into it rather than overwriting. Comment a username out to keep following them
+# without scanning them. Names you no longer follow are dropped -- but only when
+# the harvest came back whole, never off a truncated one.
 
 # Seed profile whose Following `instagrab --fetch-follows` pages (or pass --seed <name>).
 # Fetching the list touches Instagram's friendship endpoint, so run it rarely.
