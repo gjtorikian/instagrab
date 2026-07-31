@@ -307,22 +307,44 @@ fn run_fetch_follows(s: &Scraper, cfg: &config::Config, flags: &Flags, out: &mut
         let _ = out.write_json(&alert);
         process::exit(EXIT_LOGGED_OUT);
     }
+    // An error with a non-empty list is a partial page (e.g. a 429 mid-
+    // pagination) still worth merging — but additively only. The merge deletes
+    // names the harvest didn't return, and absence from a truncated list is not
+    // evidence of an unfollow.
+    let complete = oc.err.is_none();
     if let Some(e) = &oc.err {
         logln(&format!("fetch-follows error: {e}"));
-        // No usernames at all means the fetch truly failed; a non-empty list
-        // with an error is a partial page (e.g. a 429 mid-pagination) worth keeping.
+        // No usernames at all means the fetch truly failed.
         if oc.usernames.is_empty() {
             process::exit(EXIT_BROWSER_ERROR);
         }
     }
-    if let Err(e) = cache::write_friends(&cfg.friends_path(), &oc.usernames) {
-        logln(&format!("fetch-follows write follows file: {e}"));
-        process::exit(EXIT_CONFIG_ERROR);
+    let outcome = match cache::merge_friends(&cfg.friends_path(), &oc.usernames, complete) {
+        Ok(o) => o,
+        Err(e) => {
+            logln(&format!("fetch-follows write follows file: {e}"));
+            process::exit(EXIT_CONFIG_ERROR);
+        }
+    };
+    // Withheld deletions are the one outcome a downstream reader can't infer
+    // from the file itself: the list looks intact but is a merge behind.
+    if outcome.deletions_skipped {
+        let mut alert = new_alert("follows_partial");
+        alert.note = format!(
+            "harvest returned {} names; merged additively, deleted nothing",
+            oc.usernames.len()
+        );
+        alert.username = seed;
+        let _ = out.write_json(&alert);
     }
     println!(
-        "fetched {} follows -> {}",
+        "fetched {} follows -> {} ({} added, {} removed, {} excluded, {} scannable)",
         oc.usernames.len(),
-        cfg.friends_path()
+        cfg.friends_path(),
+        outcome.added,
+        outcome.removed,
+        outcome.excluded,
+        outcome.active
     );
 }
 

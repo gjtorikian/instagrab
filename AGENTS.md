@@ -57,6 +57,18 @@ Things that look wrong or removable until you know why:
   a too-short idle timeout drops the connection between profiles.
 - **JSONL is append-only.** Alerts are interleaved as `event: "alert"` lines
   alongside result lines; downstream readers must tolerate both shapes.
+- **`--fetch-follows` merges into `friends.txt`; it must never overwrite it.**
+  The file is the durable record of what to scrape, not a cache of what IG
+  says — a commented-out username is an *exclusion* the user (or a UI that owns
+  the file) set deliberately, and it has to survive every harvest. `cache.rs`
+  keeps surviving lines byte-for-byte and preserves prose and blanks in place.
+- **Deletion on absence is gated twice.** The merge drops names the harvest
+  didn't return, so a truncated harvest would prune the file. `main.rs` passes
+  `allow_deletes = oc.err.is_none()`, and `cache.rs` independently withholds
+  deletes when a "clean" harvest returns under half the entries on file
+  (pagination can end early without erroring). Either path emits a
+  `follows_partial` alert. Do not relax either guard: a stale extra name costs
+  one wasted scrape, a wrong delete costs data nothing else holds.
 - **Exit codes are part of the contract** (cron + alerting key off them):
   0 OK, 1 config, 2 logged*out, 3 schema_drift, 4 browser, 5 canary_failed.
   See the `EXIT*\*`consts in`src/main.rs`.

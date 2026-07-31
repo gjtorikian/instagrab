@@ -30,7 +30,7 @@ You'll need a recent Rust toolchain and Chrome.
 cargo build
 ./target/debug/instagrab --write-sample-config ./config.toml
 
-# 3. Fetch your follows list (writes <output_path>/friends.txt):
+# 3. Fetch your follows list (merges into <output_path>/friends.txt):
 ./target/debug/instagrab --config ./config.toml --fetch-follows
 
 # 4. Scan everyone on that list (writes <output_path>/runs.jsonl + images):
@@ -40,7 +40,7 @@ tail -1 <output_path>/runs.jsonl | jq .
 
 instagrab does two things:
 
-- **`--fetch-follows`** pages your seed profile's Following into a follows file (run it rarely).
+- **`--fetch-follows`** merges your seed profile's Following into a follows file you can edit (run it rarely).
 - The **default run** scans everyone in that file for recent posts + first image (run it daily).
 
 For more information, see [Friends fan-out](#friends-fan-out) and [Configuration](#configuration).
@@ -91,18 +91,56 @@ instagrab's main mode scans everyone a seed profile follows, re-fetching that
 list on demand.
 
 `instagrab --fetch-follows` pages `seed_username`'s _Following_ once, at a human
-pace, and writes the handles to the follows file (`<output_path>/friends.txt`).
-This is the only path that touches Instagram's friendship endpoint (isolated in
-`src/follows.rs`); it is off by default and detection-sensitive, so run it
-rarely. It prints progress (`fetching follows... N so far`) and a final count.
+pace, and merges the handles into the follows file
+(`<output_path>/friends.txt`). This is the only path that touches Instagram's
+friendship endpoint (isolated in `src/follows.rs`); it is off by default and
+detection-sensitive, so run it rarely. It prints progress
+(`fetching follows... N so far`) and a summary of what the merge changed.
 `--seed <name>` overrides `seed_username` ad hoc.
+
+### The follows file is yours to edit
+
+The harvest **merges**; it does not overwrite. Your edits survive it, so the
+file — not Instagram — is the durable record of what gets scraped.
+
+There's one username per line, and a commented-out username is an exclusion: still
+followed, just never scanned.
+
+```
+# accounts I follow but don't want on the wall
+anniebannie
+# nononancy           <- excluded; the harvest leaves this comment alone
+berryp
+```
+
+Across a `--fetch-follows`:
+
+| On file       | Still followed? | Result                              |
+| ------------- | --------------- | ----------------------------------- |
+| `anniebannie` | yes             | kept verbatim                       |
+| `# nononancy` | yes             | kept verbatim — exclusion preserved |
+| `berryp`      | no              | dropped                             |
+| `# oldfriend` | no              | dropped                             |
+| —             | yes, and new    | appended                            |
+
+Blank lines and multi-word comments are preserved exactly where they sit. A
+comment holding a lone username-shaped word is read as an exclusion, so keep
+header comments to more than one word — `# archived` would be mistaken for a
+handle, `# archived accounts` would not.
+
+**Deletions are withheld whenever the harvest might be short.** Absence from a
+truncated list isn't evidence of an unfollow, and one rate-limited page would
+otherwise prune most of the file. The merge stays additive when the fetch
+errored (e.g. an HTTP 429 mid-pagination) or when a clean harvest came back with
+under half the entries already on file; either way it emits a `follows_partial`
+alert and deletes nothing.
 
 ## Commands
 
 | Command                                     | What it does                                                                                       |
 | ------------------------------------------- | -------------------------------------------------------------------------------------------------- |
 | `instagrab`                                 | Scan everyone in the follows file (the daily job).                                                 |
-| `instagrab --fetch-follows [--seed <name>]` | Rebuild the follows file from the seed's Following (run rarely).                                   |
+| `instagrab --fetch-follows [--seed <name>]` | Merge the seed's Following into the follows file, keeping your edits (run rarely).                 |
 | `instagrab --once <name>`                   | Scan a single profile, ignoring the follows list.                                                  |
 | `instagrab --limit <n>`                     | Scan at most N profiles from the follows list (order stalest-first upstream to scan the oldest N). |
 | `instagrab --dry-run`                       | Connect to Chrome and exit — a connection test.                                                    |
@@ -135,14 +173,17 @@ runs first and exits 5 if extraction looks broken.
 
 Out-of-band conditions surface as `event: "alert"` lines and a non-zero exit:
 
-| Kind           | Meaning                                                                                 | Exit |
-| -------------- | --------------------------------------------------------------------------------------- | ---- |
-| `logged_out`   | IG demanded login or redirected to `/accounts/login`                                    | 2    |
-| `schema_drift` | `web_profile_info` parsed but expected fields are missing on **every** profile this run | 3    |
+| Kind              | Meaning                                                                                 | Exit |
+| ----------------- | --------------------------------------------------------------------------------------- | ---- |
+| `logged_out`      | IG demanded login or redirected to `/accounts/login`                                    | 2    |
+| `schema_drift`    | `web_profile_info` parsed but expected fields are missing on **every** profile this run | 3    |
+| `follows_partial` | A `--fetch-follows` harvest looked truncated, so the merge deleted nothing              | 0    |
 
 `logged_out` means: re-run the SSH-tunnel login bootstrap (see `deploy/README.md`).
 `schema_drift` means: IG renamed/removed a JSON path; update
 `EXPECTED_PROFILE_PATHS` and the parser in `src/parse.rs`.
+`follows_partial` is not a failure — the follows file is intact and simply a
+merge behind. It exits 0 (or 4, if the fetch returned nothing at all).
 
 ## Deploying
 
