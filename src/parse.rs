@@ -1,10 +1,12 @@
-//! web_profile_info / user-feed JSON -> Result, window filter, and the
-//! schema-drift detector (EXPECTED_PROFILE_PATHS).
+//! GraphQL profile / posts JSON -> ScrapeResult, window filter, and the
+//! schema-drift detector (EXPECTED_GRAPHQL_PROFILE_FIELDS).
 
 use anyhow::{Result as AnyResult, anyhow};
 use chrono::{DateTime, Timelike, Utc};
-use serde::{Deserialize, Serialize, Serializer};
+use regex::Regex;
+use serde::{Serialize, Serializer};
 use serde_json::Value;
+use std::sync::OnceLock;
 
 #[derive(Serialize, Clone, Debug)]
 pub struct RecentPost {
@@ -148,17 +150,6 @@ impl ScrapeResult {
     }
 }
 
-/// The JSON paths instagrab expects in a `web_profile_info` payload.
-/// Used for schema-drift detection.
-pub const EXPECTED_PROFILE_PATHS: &[&str] = &[
-    "data.user.username",
-    "data.user.full_name",
-    "data.user.biography",
-    "data.user.edge_followed_by.count",
-    "data.user.edge_follow.count",
-    "data.user.edge_owner_to_timeline_media.count",
-];
-
 #[derive(Debug)]
 pub struct ParsedProfile {
     pub result: Option<ScrapeResult>,
@@ -166,161 +157,28 @@ pub struct ParsedProfile {
     pub requires_login: bool,
 }
 
-/// Parses a raw `users/web_profile_info` JSON body. Returns the result, the
-/// list of missing-but-expected paths (for drift detection), and whether the
-/// response indicates a logged-out state.
-pub fn parse_web_profile_info(username: &str, raw: &[u8]) -> AnyResult<ParsedProfile> {
-    let doc: Value = serde_json::from_slice(raw)?;
-
-    if requires_login(&doc) {
-        return Ok(ParsedProfile {
-            result: None,
-            missing: Vec::new(),
-            requires_login: true,
-        });
-    }
-
-    let missing = validate_schema(&doc, EXPECTED_PROFILE_PATHS);
-
-    let user = match nav(&doc, &["data", "user"]).filter(|v| v.is_object()) {
-        Some(u) => u,
-        None => return Err(anyhow!("data.user missing")),
-    };
-
-    let mut r = ScrapeResult::new(username, "graphql");
-
-    if let Some(v) = user.get("id").and_then(Value::as_str) {
-        r.user_id = v.to_string();
-    }
-    r.full_name = user
-        .get("full_name")
-        .and_then(Value::as_str)
-        .map(String::from);
-    r.biography = user
-        .get("biography")
-        .and_then(Value::as_str)
-        .map(String::from);
-    r.is_private = user.get("is_private").and_then(Value::as_bool);
-    r.followers = nav_int(user, &["edge_followed_by", "count"]);
-    r.following = nav_int(user, &["edge_follow", "count"]);
-    r.posts = nav_int(user, &["edge_owner_to_timeline_media", "count"]);
-
-    if let Some(edges) =
-        nav(user, &["edge_owner_to_timeline_media", "edges"]).and_then(Value::as_array)
-    {
-        for e in edges {
-            let node = match e.get("node").filter(|v| v.is_object()) {
-                Some(n) => n,
-                None => continue,
-            };
-            let shortcode = node.get("shortcode").and_then(Value::as_str).unwrap_or("");
-            if shortcode.is_empty() {
-                continue;
-            }
-            let mut rp = RecentPost::new(shortcode.to_string());
-            rp.caption = caption_from_node(node);
-            rp.is_video = node.get("is_video").and_then(Value::as_bool);
-            if let Some(ts) = node.get("taken_at_timestamp").and_then(Value::as_f64) {
-                rp.taken_at_unix = Some(ts as i64);
-            }
-            rp.display_url = node
-                .get("display_url")
-                .and_then(Value::as_str)
-                .map(String::from);
-            let (mc, carousel, hv) = media_facts_from_graphql_node(node);
-            rp.media_count = mc;
-            rp.is_carousel = carousel;
-            rp.has_video = hv;
-            r.push_post(rp);
-        }
-    }
-
-    Ok(ParsedProfile {
-        result: Some(r),
-        missing,
-        requires_login: false,
-    })
-}
-
-/// Checks for IG's logged-out shape. Empirically the API returns
-/// `{"data": {}, "status": "ok"}` or includes a `require_login` indicator;
-/// we accept several signals.
+/// Checks for IG's logged-out shape.
+///
+/// Only explicit signals count. The old structural test ("`data.user` is
+/// absent or empty") belonged to `web_profile_info`, whose envelope always had
+/// that key; GraphQL responses are keyed by query (`xdt_user_by_username` and
+/// friends), so applying it here would flag every healthy scrape as logged
+/// out. On the GraphQL path a dead session shows up earlier and louder: the
+/// profile navigation redirects to /accounts/login (caught by `read_dom_facts`)
+/// or the query itself answers 401/403.
 fn requires_login(doc: &Value) -> bool {
-    if doc.get("require_login").and_then(Value::as_bool) == Some(true) {
-        return true;
-    }
-    if doc.get("requires_login").and_then(Value::as_bool) == Some(true) {
-        return true;
-    }
-    if let Some(msg) = doc.get("message").and_then(Value::as_str) {
-        if msg.to_lowercase().contains("login") {
+    for key in ["require_login", "requires_login"] {
+        if doc.get(key).and_then(Value::as_bool) == Some(true) {
             return true;
         }
     }
-    if let Some(data) = doc.get("data").and_then(Value::as_object) {
-        match data.get("user") {
-            None => return true,
-            Some(u) => {
-                if let Some(m) = u.as_object() {
-                    if m.is_empty() {
-                        return true;
-                    }
-                }
-            }
+    if let Some(msg) = doc.get("message").and_then(Value::as_str) {
+        let m = msg.to_lowercase();
+        if m.contains("login") || m.contains("log in") {
+            return true;
         }
     }
     false
-}
-
-/// Derives (media_count, is_carousel, has_video) from a web_profile_info
-/// timeline node. Carousels expose `edge_sidecar_to_children`; a node's own
-/// `is_video` covers single videos. Shape-tolerant — a missing sidecar
-/// degrades to a single image (count 1).
-fn media_facts_from_graphql_node(node: &Value) -> (Option<i64>, Option<bool>, Option<bool>) {
-    let top_is_video = node
-        .get("is_video")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    if let Some(children) =
-        nav(node, &["edge_sidecar_to_children", "edges"]).and_then(Value::as_array)
-    {
-        let count = children.len() as i64;
-        let child_video = children.iter().any(|c| {
-            c.get("node")
-                .and_then(|n| n.get("is_video"))
-                .and_then(Value::as_bool)
-                == Some(true)
-        });
-        let hv = if top_is_video || child_video {
-            Some(true)
-        } else {
-            None
-        };
-        return (Some(count), Some(true), hv);
-    }
-    let hv = if top_is_video { Some(true) } else { None };
-    (Some(1), None, hv)
-}
-
-fn caption_from_node(node: &Value) -> Option<String> {
-    let edges = nav(node, &["edge_media_to_caption", "edges"]).and_then(Value::as_array)?;
-    let first = edges.first()?;
-    nav(first, &["node", "text"])
-        .and_then(Value::as_str)
-        .map(String::from)
-}
-
-/// Returns the subset of expected dotted paths that are missing or null in doc.
-fn validate_schema(doc: &Value, expected: &[&str]) -> Vec<String> {
-    let mut missing = Vec::new();
-    for p in expected {
-        let parts: Vec<&str> = p.split('.').collect();
-        match nav(doc, &parts) {
-            Some(v) if !v.is_null() => {}
-            _ => missing.push((*p).to_string()),
-        }
-    }
-    missing
 }
 
 // --- value navigation helpers ------------------------------------------------
@@ -343,44 +201,18 @@ fn nav_int(v: &Value, keys: &[&str]) -> Option<i64> {
 
 // --- user feed ---------------------------------------------------------------
 
-#[derive(Deserialize, Default)]
-#[serde(default)]
-struct FeedDoc {
-    items: Vec<Value>,
-    more_available: bool,
-    next_max_id: String,
-}
-
+#[derive(Debug)]
 pub struct FeedPage {
     pub posts: Vec<RecentPost>,
     /// Raw count of items in the response, so callers can distinguish "IG
     /// returned nothing" from "IG returned items but our extractor couldn't
     /// find shortcodes."
     pub raw_count: usize,
-    pub next_max_id: String,
-    pub more_available: bool,
-}
-
-/// Parses a /api/v1/feed/user/<id>/ response. The mobile-API shape uses
-/// `code` (not `shortcode`), `taken_at` (not `taken_at_timestamp`), and
-/// `image_versions2.candidates[].url` (not `display_url`). For carousels the
-/// top-level item may lack `code`/image; we then fall back to the first child
-/// in `carousel_media`.
-pub fn parse_user_feed(raw: &[u8]) -> AnyResult<FeedPage> {
-    let doc: FeedDoc = serde_json::from_slice(raw)?;
-
-    let mut posts = Vec::new();
-    for it in &doc.items {
-        if let Some(rp) = post_from_feed_item(it) {
-            posts.push(rp);
-        }
-    }
-    Ok(FeedPage {
-        posts,
-        raw_count: doc.items.len(),
-        next_max_id: doc.next_max_id,
-        more_available: doc.more_available,
-    })
+    /// Opaque continuation token. The mobile API calls this `next_max_id`; the
+    /// GraphQL connection calls it `page_info.end_cursor`. Same role, and
+    /// empirically the same `<pk>_<uid>` shape.
+    pub next_cursor: String,
+    pub has_more: bool,
 }
 
 /// Builds a RecentPost from a /api/v1/feed/user/ item.
@@ -493,6 +325,392 @@ fn candidates_best_url(it: &Value) -> String {
     best_url
 }
 
+// --- GraphQL: profile posts tab ----------------------------------------------
+
+/// The connection field `PolarisProfilePostsTabContentQuery_connection`
+/// returns. Looked up by name first; if IG renames it we fall back to any
+/// object under `data` that looks like a Relay connection, since the rename is
+/// exactly the kind of drift this project expects.
+const FEED_CONNECTION_KEY: &str = "xdt_api__v1__feed__user_timeline_graphql_connection";
+
+/// Parses a `/graphql/query` profile-posts response. The per-node shape is the
+/// mobile-API shape — `code`, `taken_at`, `image_versions2.candidates[].url` —
+/// so `post_from_feed_item` is reused verbatim. Only the envelope differs:
+/// items arrive as `edges[].node` and the cursor as `page_info.end_cursor`.
+///
+/// Note the carousel inversion versus the mobile feed: here the *parent* node
+/// carries `code` and children carry `"code": null`, so the child fallback in
+/// `post_from_feed_item` never fires on this path.
+pub fn parse_graphql_feed(raw: &[u8]) -> AnyResult<FeedPage> {
+    let doc: Value = serde_json::from_slice(raw)?;
+
+    if let Some(errs) = doc.get("errors").and_then(Value::as_array) {
+        if !errs.is_empty() {
+            let msg = errs
+                .first()
+                .and_then(|e| e.get("message"))
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            return Err(anyhow!("graphql error: {msg}"));
+        }
+    }
+
+    let conn = find_connection(&doc).ok_or_else(|| anyhow!("no posts connection in response"))?;
+
+    let edges = conn
+        .get("edges")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("connection has no edges"))?;
+
+    let mut posts = Vec::new();
+    for e in edges {
+        let node = match e.get("node").filter(|v| v.is_object()) {
+            Some(n) => n,
+            None => continue,
+        };
+        if let Some(rp) = post_from_feed_item(node) {
+            posts.push(rp);
+        }
+    }
+
+    let page_info = conn.get("page_info");
+    let next_cursor = page_info
+        .and_then(|p| p.get("end_cursor"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let has_more = page_info
+        .and_then(|p| p.get("has_next_page"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    Ok(FeedPage {
+        posts,
+        raw_count: edges.len(),
+        next_cursor,
+        has_more,
+    })
+}
+
+/// Locates the posts connection: the documented key first, then any object
+/// under `data` carrying both `edges` and `page_info`.
+fn find_connection(doc: &Value) -> Option<&Value> {
+    let data = doc.get("data")?.as_object()?;
+    if let Some(v) = data.get(FEED_CONNECTION_KEY).filter(|v| v.is_object()) {
+        return Some(v);
+    }
+    data.values().find(|v| {
+        v.get("edges").map(Value::is_array).unwrap_or(false) && v.get("page_info").is_some()
+    })
+}
+
+/// Pulls the owning account's numeric id out of a posts-connection response.
+///
+/// Guarded by username for the same reason `find_user_object` is: a node's
+/// `user` is usually the profile owner, but reposts and coauthored items carry
+/// someone else's. Only a node that names the account we asked for counts.
+pub fn user_id_from_feed(raw: &[u8], username: &str) -> Option<String> {
+    let doc: Value = serde_json::from_slice(raw).ok()?;
+    let conn = find_connection(&doc)?;
+    for e in conn.get("edges")?.as_array()? {
+        let node = e.get("node")?;
+        let owner = match node.get("user").filter(|u| u.is_object()) {
+            Some(u) => u,
+            None => continue,
+        };
+        let names_it = owner
+            .get("username")
+            .and_then(Value::as_str)
+            .map(|u| u.eq_ignore_ascii_case(username))
+            .unwrap_or(false);
+        if !names_it {
+            continue;
+        }
+        for key in ["pk", "id"] {
+            match owner.get(key) {
+                Some(Value::String(s)) if !s.is_empty() => return Some(s.clone()),
+                Some(Value::Number(n)) => return Some(n.to_string()),
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
+// --- profile metadata from the server-rendered page --------------------------
+
+/// Profile fields recovered from the page's meta tags.
+///
+/// Neither GraphQL query the profile page fires carries the header — both
+/// return the posts connection — so the counts come from the `og:description`
+/// Instagram server-renders on a direct navigation. No extra request: the HTML
+/// is already in hand for app-id extraction.
+///
+/// Caveat worth knowing: large accounts get abbreviated counts ("695M"), so
+/// followers for mega-accounts are rounded. Ordinary accounts render exact
+/// comma-separated numbers.
+#[derive(Debug, Default, PartialEq)]
+pub struct HtmlProfile {
+    pub full_name: Option<String>,
+    pub followers: Option<i64>,
+    pub following: Option<i64>,
+    pub posts: Option<i64>,
+    pub is_private: Option<bool>,
+}
+
+pub fn profile_fields_from_html(username: &str, html: &str) -> HtmlProfile {
+    let mut out = HtmlProfile::default();
+
+    if let Some(desc) = meta_content(html, "og:description")
+        .or_else(|| meta_content(html, "description"))
+        .filter(|d| mentions_handle(d, username))
+    {
+        if let Some(caps) = counts_re().captures(&desc) {
+            out.followers = parse_abbreviated_count(caps.get(1).map_or("", |m| m.as_str()));
+            out.following = parse_abbreviated_count(caps.get(2).map_or("", |m| m.as_str()));
+            out.posts = parse_abbreviated_count(caps.get(3).map_or("", |m| m.as_str()));
+        }
+    }
+
+    // "Instagram (@instagram) • Instagram photos and videos"
+    if let Some(title) = meta_content(html, "og:title").filter(|t| mentions_handle(t, username)) {
+        if let Some((name, _)) = title.split_once(" (@") {
+            let name = name.trim();
+            if !name.is_empty() {
+                out.full_name = Some(name.to_string());
+            }
+        }
+    }
+
+    if html.contains("This Account is Private") || html.contains("This account is private") {
+        out.is_private = Some(true);
+    }
+
+    out
+}
+
+/// Only trust a meta tag that names the profile we asked for — the same guard
+/// `find_user_object` needs, for the same reason.
+fn mentions_handle(text: &str, username: &str) -> bool {
+    text.to_lowercase()
+        .contains(&format!("(@{})", username.to_lowercase()))
+}
+
+fn meta_content(html: &str, key: &str) -> Option<String> {
+    static PATTERNS: OnceLock<std::sync::Mutex<std::collections::HashMap<String, Regex>>> =
+        OnceLock::new();
+    let cache = PATTERNS.get_or_init(Default::default);
+    let re = {
+        let mut map = cache.lock().ok()?;
+        map.entry(key.to_string())
+            .or_insert_with(|| {
+                // Attribute order varies; match either spelling around content=.
+                Regex::new(&format!(
+                    r#"(?is)<meta[^>]*(?:property|name)\s*=\s*["']{}["'][^>]*content\s*=\s*["']([^"']*)["']|<meta[^>]*content\s*=\s*["']([^"']*)["'][^>]*(?:property|name)\s*=\s*["']{}["']"#,
+                    regex::escape(key),
+                    regex::escape(key)
+                ))
+                .expect("meta regex compiles")
+            })
+            .clone()
+    };
+    let caps = re.captures(html)?;
+    let raw = caps
+        .get(1)
+        .or_else(|| caps.get(2))
+        .map(|m| m.as_str())
+        .unwrap_or("");
+    if raw.is_empty() {
+        return None;
+    }
+    Some(decode_entities(raw))
+}
+
+fn decode_entities(s: &str) -> String {
+    s.replace("&quot;", "\"")
+        .replace("&#039;", "'")
+        .replace("&#39;", "'")
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+}
+
+fn counts_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r"(?i)([0-9][0-9,.]*\s*[KMB]?)\s+Followers,\s*([0-9][0-9,.]*\s*[KMB]?)\s+Following,\s*([0-9][0-9,.]*\s*[KMB]?)\s+Posts",
+        )
+        .expect("counts regex compiles")
+    })
+}
+
+/// "8,021" -> 8021; "695M" -> 695000000; "1.2K" -> 1200.
+fn parse_abbreviated_count(s: &str) -> Option<i64> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let (num, mult) = match s.chars().last()?.to_ascii_uppercase() {
+        'K' => (&s[..s.len() - 1], 1_000f64),
+        'M' => (&s[..s.len() - 1], 1_000_000f64),
+        'B' => (&s[..s.len() - 1], 1_000_000_000f64),
+        _ => (s, 1f64),
+    };
+    let cleaned: String = num
+        .chars()
+        .filter(|c| *c != ',' && !c.is_whitespace())
+        .collect();
+    let v: f64 = cleaned.parse().ok()?;
+    Some((v * mult).round() as i64)
+}
+
+// --- GraphQL: profile header --------------------------------------------------
+
+/// Profile metadata field names, as IG's GraphQL responses spell them. Used
+/// both to locate the user object and to report drift.
+pub const EXPECTED_GRAPHQL_PROFILE_FIELDS: &[&str] = &[
+    "username",
+    "full_name",
+    "biography",
+    "follower_count",
+    "following_count",
+    "media_count",
+];
+
+/// Extracts profile metadata from a `/graphql/query` profile-header response.
+///
+/// The exact query and envelope key are discovered at runtime rather than
+/// pinned, so this walks the document for the object that carries the most
+/// expected fields instead of a fixed path. That keeps it working across the
+/// `xdt_user_by_username` / `user` / `xdt_api__v1__users__*` spellings IG has
+/// used, at the cost of being heuristic.
+///
+/// Returns the result plus the expected-but-absent field names, so a uniform
+/// miss can raise the existing schema_drift alert.
+pub fn parse_graphql_profile(username: &str, raw: &[u8]) -> AnyResult<ParsedProfile> {
+    let doc: Value = serde_json::from_slice(raw)?;
+
+    if requires_login(&doc) {
+        return Ok(ParsedProfile {
+            result: None,
+            missing: Vec::new(),
+            requires_login: true,
+        });
+    }
+
+    let user = match find_user_object(&doc, username) {
+        Some(u) => u,
+        None => return Err(anyhow!("no profile object in response")),
+    };
+
+    let missing: Vec<String> = EXPECTED_GRAPHQL_PROFILE_FIELDS
+        .iter()
+        .filter(|f| user.get(**f).map(Value::is_null).unwrap_or(true))
+        .map(|f| (*f).to_string())
+        .collect();
+
+    let mut r = ScrapeResult::new(username, "graphql");
+
+    // `pk` and `id` both appear; either may be string or number.
+    for key in ["pk", "id"] {
+        if r.user_id.is_empty() {
+            if let Some(v) = user.get(key) {
+                r.user_id = match v {
+                    Value::String(s) => s.clone(),
+                    Value::Number(n) => n.to_string(),
+                    _ => String::new(),
+                };
+            }
+        }
+    }
+    r.full_name = user
+        .get("full_name")
+        .and_then(Value::as_str)
+        .map(String::from);
+    r.biography = user
+        .get("biography")
+        .and_then(Value::as_str)
+        .map(String::from);
+    r.is_private = user.get("is_private").and_then(Value::as_bool);
+    r.followers = profile_count(user, &["follower_count", "edge_followed_by"]);
+    r.following = profile_count(user, &["following_count", "edge_follow"]);
+    r.posts = profile_count(user, &["media_count", "edge_owner_to_timeline_media"]);
+
+    Ok(ParsedProfile {
+        result: Some(r),
+        missing,
+        requires_login: false,
+    })
+}
+
+/// Reads a count that IG spells either flat (`follower_count`) or nested
+/// (`edge_followed_by.count`).
+fn profile_count(user: &Value, keys: &[&str]) -> Option<i64> {
+    for k in keys {
+        match user.get(k) {
+            Some(Value::Number(n)) => return n.as_i64(),
+            Some(v) if v.is_object() => {
+                if let Some(c) = nav_int(v, &["count"]) {
+                    return Some(c);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Walks the document for the profile-header object.
+///
+/// Two guards, both learned the hard way: the object must carry a `username`
+/// equal to the one we asked for, and it must carry at least one count field.
+/// Without them a per-post `user` stub (username + full_name) scores 2 and
+/// wins by default when no header is present — which is exactly what happened
+/// on the first live run, writing a tagged creator's `user_id` and `full_name`
+/// into a line labelled `username: instagram`. Missing data is recoverable;
+/// confidently wrong identity data is not.
+fn find_user_object<'a>(doc: &'a Value, username: &str) -> Option<&'a Value> {
+    const COUNT_FIELDS: &[&str] = &[
+        "follower_count",
+        "following_count",
+        "media_count",
+        "edge_followed_by",
+        "edge_follow",
+        "edge_owner_to_timeline_media",
+    ];
+
+    let mut best: Option<(usize, &Value)> = None;
+    let mut stack = vec![doc];
+    while let Some(v) = stack.pop() {
+        match v {
+            Value::Object(map) => {
+                let identifies = map
+                    .get("username")
+                    .and_then(Value::as_str)
+                    .map(|u| u.eq_ignore_ascii_case(username))
+                    .unwrap_or(false);
+                let has_counts = COUNT_FIELDS
+                    .iter()
+                    .any(|f| map.get(*f).map(|x| !x.is_null()).unwrap_or(false));
+                if identifies && has_counts {
+                    let score = EXPECTED_GRAPHQL_PROFILE_FIELDS
+                        .iter()
+                        .filter(|f| map.get(**f).map(|x| !x.is_null()).unwrap_or(false))
+                        .count();
+                    if best.map(|(s, _)| score > s).unwrap_or(true) {
+                        best = Some((score, v));
+                    }
+                }
+                stack.extend(map.values());
+            }
+            Value::Array(items) => stack.extend(items.iter()),
+            _ => {}
+        }
+    }
+    best.map(|(_, v)| v)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -512,190 +730,364 @@ mod tests {
     }
 
     #[test]
-    fn parse_web_profile_info_happy_path() {
-        let raw = br#"{
-          "data": {"user": {
-            "id": "42",
-            "username": "zuck",
-            "full_name": "Mark",
-            "biography": "bio",
-            "is_private": false,
-            "edge_followed_by": {"count": 100},
-            "edge_follow": {"count": 5},
-            "edge_owner_to_timeline_media": {
-              "count": 2,
-              "edges": [
-                {"node": {
-                  "shortcode": "ABC",
-                  "is_video": false,
-                  "taken_at_timestamp": 1715000000,
-                  "display_url": "https://x/1.jpg",
-                  "edge_media_to_caption": {"edges": [{"node": {"text": "hi"}}]}
-                }},
-                {"node": {"shortcode": ""}},
-                {"node": {"shortcode": "DEF"}}
-              ]
-            }
-          }}
-        }"#;
-        let p = parse_web_profile_info("zuck", raw).unwrap();
+    fn graphql_envelope_without_data_user_is_not_logged_out() {
+        // Regression: the web_profile_info-era structural check treated a
+        // missing `data.user` as logged-out, which every GraphQL response is.
+        let raw = br#"{"data": {"xdt_user_by_username": {
+            "username": "x", "full_name": "X", "follower_count": 1
+        }}}"#;
+        let p = parse_graphql_profile("x", raw).unwrap();
         assert!(!p.requires_login);
-        assert!(p.missing.is_empty());
-        let r = p.result.unwrap();
-        assert_eq!(r.user_id, "42");
-        assert_eq!(r.full_name.as_deref(), Some("Mark"));
-        assert_eq!(r.followers, Some(100));
-        assert_eq!(r.following, Some(5));
-        assert_eq!(r.posts, Some(2));
-        let posts = r.recent_posts.as_ref().unwrap();
-        assert_eq!(posts.len(), 2);
-        assert_eq!(posts[0].shortcode, "ABC");
-        assert_eq!(posts[0].url, "https://www.instagram.com/p/ABC/");
-        assert_eq!(posts[0].caption.as_deref(), Some("hi"));
-        assert_eq!(posts[0].taken_at_unix, Some(1715000000));
-        assert_eq!(posts[1].shortcode, "DEF");
-        assert_eq!(posts[1].caption, None);
+        assert!(p.result.is_some());
     }
 
     #[test]
-    fn requires_login_shapes() {
+    fn explicit_login_signals_still_detected() {
         for raw in [
-            r#"{"require_login": true}"#,
-            r#"{"requires_login": true}"#,
-            r#"{"message": "Please Login to continue"}"#,
-            r#"{"data": {}, "status": "ok"}"#,
-            r#"{"data": {"user": {}}}"#,
+            &br#"{"require_login": true}"#[..],
+            &br#"{"requires_login": true}"#[..],
+            &br#"{"message": "Please log in to continue"}"#[..],
         ] {
-            let p = parse_web_profile_info("x", raw.as_bytes()).unwrap();
-            assert!(p.requires_login, "expected requires_login for {raw}");
+            let p = parse_graphql_profile("x", raw).unwrap();
+            assert!(
+                p.requires_login,
+                "missed signal in {:?}",
+                std::str::from_utf8(raw)
+            );
         }
-        // data.user = null: not a login signal, but data.user is unusable.
-        let err = parse_web_profile_info("x", br#"{"data": {"user": null}}"#).unwrap_err();
-        assert_eq!(err.to_string(), "data.user missing");
     }
 
     #[test]
-    fn validate_schema_reports_missing_paths() {
-        let raw = br#"{"data": {"user": {"username": "zuck", "full_name": null,
-            "edge_followed_by": {"count": "12345"}}}}"#;
-        let p = parse_web_profile_info("zuck", raw).unwrap();
+    fn user_id_comes_from_the_node_owned_by_the_requested_account() {
         assert_eq!(
-            p.missing,
-            vec![
-                "data.user.full_name",
-                "data.user.biography",
-                "data.user.edge_follow.count",
-                "data.user.edge_owner_to_timeline_media.count",
-            ]
+            user_id_from_feed(GRAPHQL_FEED_WITH_USER, "instagram").as_deref(),
+            Some("25025320")
         );
-        // string count still parses
-        assert_eq!(p.result.unwrap().followers, Some(12345));
     }
 
     #[test]
-    fn parse_user_feed_shapes() {
-        let raw = br#"{
-          "items": [
-            {"code": "AAA", "taken_at": 1715000000, "media_type": 2,
-             "caption": {"text": "vid"},
-             "image_versions2": {"candidates": [
-               {"url": "https://x/small.jpg", "width": 100},
-               {"url": "https://x/big.jpg", "width": 1080}
-             ]}},
-            {"carousel_media": [
-              {"code": "BBB", "image_versions2": {"candidates": [{"url": "https://x/c.jpg", "width": 50}]}}
-            ]},
-            {"caption": {"text": "no code at all"}}
+    fn user_id_ignores_nodes_owned_by_someone_else() {
+        // A repost's node names a different owner; taking its pk would label
+        // this account with a stranger's id.
+        assert_eq!(
+            user_id_from_feed(FEED_WITH_FOREIGN_STUBS, "instagram"),
+            None
+        );
+    }
+
+    const GRAPHQL_FEED_WITH_USER: &[u8] = br#"{"data": {
+      "xdt_api__v1__feed__user_timeline_graphql_connection": {
+        "edges": [
+          {"node": {"code": "Z", "taken_at": 0, "user": {"pk": "777", "username": "reposter"}}},
+          {"node": {"code": "A", "taken_at": 1,
+                    "user": {"pk": "25025320", "username": "instagram"}}}
+        ],
+        "page_info": {"end_cursor": "", "has_next_page": false}
+      }}}"#;
+
+    // --- profile identity guard ----------------------------------------------
+
+    /// Shaped like the real PolarisProfilePostsQuery response: posts for
+    /// `instagram`, each node embedding a *different* creator's user stub.
+    const FEED_WITH_FOREIGN_STUBS: &[u8] = br#"{"data": {
+      "xdt_api__v1__feed__user_timeline_graphql_connection": {
+        "edges": [
+          {"node": {"code": "A", "taken_at": 1, "user": {
+             "pk": "53528241800", "username": "janiesdaisies", "full_name": "janie's daisies"
+          }}},
+          {"node": {"code": "B", "taken_at": 2, "coauthor_producers": [
+             {"pk": "999", "username": "someoneelse", "full_name": "Someone Else"}
+          ]}}
+        ],
+        "page_info": {"end_cursor": "", "has_next_page": false}
+      }}}"#;
+
+    #[test]
+    fn foreign_user_stubs_never_become_the_profile() {
+        // Regression from the first live run: a tagged creator's identity was
+        // written into a line labelled username=instagram.
+        let err = parse_graphql_profile("instagram", FEED_WITH_FOREIGN_STUBS).unwrap_err();
+        assert!(err.to_string().contains("no profile object"), "got {err}");
+    }
+
+    #[test]
+    fn matching_username_without_counts_is_still_rejected() {
+        // The account's own per-post stub matches on username but carries no
+        // counts; trusting it would yield a header with everything null.
+        let raw = br#"{"data": {"c": {"edges": [{"node": {"code": "A", "user": {
+            "pk": "25025320", "username": "instagram", "full_name": "Instagram"
+        }}}], "page_info": {}}}}"#;
+        assert!(parse_graphql_profile("instagram", raw).is_err());
+    }
+
+    #[test]
+    fn real_header_is_accepted_despite_surrounding_stubs() {
+        let raw = br#"{"data": {
+          "conn": {"edges": [{"node": {"user": {
+              "pk": "53528241800", "username": "janiesdaisies", "full_name": "janie's daisies"
+          }}}]},
+          "header": {"pk": "25025320", "username": "instagram", "full_name": "Instagram",
+                     "biography": "bio", "follower_count": 5, "following_count": 6,
+                     "media_count": 7}
+        }}"#;
+        let r = parse_graphql_profile("instagram", raw)
+            .unwrap()
+            .result
+            .unwrap();
+        assert_eq!(r.user_id, "25025320");
+        assert_eq!(r.followers, Some(5));
+    }
+
+    // --- meta-tag profile ----------------------------------------------------
+
+    #[test]
+    fn meta_tags_yield_counts_and_name() {
+        let html = r#"<meta property="og:title" content="Instagram (@instagram) &#039; Instagram photos and videos" />
+        <meta property="og:description" content="695M Followers, 176 Following, 8,021 Posts - See Instagram photos and videos from Instagram (@instagram)" />"#;
+        let p = profile_fields_from_html("instagram", html);
+        assert_eq!(p.followers, Some(695_000_000));
+        assert_eq!(p.following, Some(176));
+        assert_eq!(p.posts, Some(8021));
+        assert_eq!(p.full_name.as_deref(), Some("Instagram"));
+    }
+
+    #[test]
+    fn meta_tags_for_a_different_handle_are_ignored() {
+        // Same guard as find_user_object: never attribute another account's
+        // numbers to this one.
+        let html = r#"<meta property="og:description" content="12 Followers, 3 Following, 4 Posts - See Instagram photos and videos from Someone (@someoneelse)" />"#;
+        assert_eq!(
+            profile_fields_from_html("instagram", html),
+            HtmlProfile::default()
+        );
+    }
+
+    #[test]
+    fn meta_name_description_is_accepted_too() {
+        let html = r#"<meta name="description" content="1,234 Followers, 567 Following, 89 Posts - See Instagram photos and videos from Jane (@jane_doe)" />"#;
+        let p = profile_fields_from_html("jane_doe", html);
+        assert_eq!(p.followers, Some(1234));
+        assert_eq!(p.posts, Some(89));
+    }
+
+    #[test]
+    fn content_before_property_attribute_order_parses() {
+        let html = r#"<meta content="5 Followers, 6 Following, 7 Posts - See Instagram photos and videos from A (@a)" property="og:description">"#;
+        assert_eq!(profile_fields_from_html("a", html).followers, Some(5));
+    }
+
+    #[test]
+    fn private_account_is_flagged() {
+        let html = r#"<meta property="og:description" content="5 Followers, 6 Following, 7 Posts - See Instagram photos and videos from A (@a)"><h2>This Account is Private</h2>"#;
+        assert_eq!(profile_fields_from_html("a", html).is_private, Some(true));
+    }
+
+    #[test]
+    fn abbreviated_counts_scale() {
+        assert_eq!(parse_abbreviated_count("8,021"), Some(8021));
+        assert_eq!(parse_abbreviated_count("695M"), Some(695_000_000));
+        assert_eq!(parse_abbreviated_count("1.2K"), Some(1200));
+        assert_eq!(parse_abbreviated_count("1.5B"), Some(1_500_000_000));
+        assert_eq!(parse_abbreviated_count(""), None);
+        assert_eq!(parse_abbreviated_count("n/a"), None);
+    }
+
+    #[test]
+    fn missing_meta_tags_yield_nothing_rather_than_guesses() {
+        assert_eq!(
+            profile_fields_from_html("x", "<html></html>"),
+            HtmlProfile::default()
+        );
+    }
+
+    // --- GraphQL envelope -----------------------------------------------------
+
+    /// Mirrors the live PolarisProfilePostsTabContentQuery_connection payload:
+    /// edges[].node with mobile-shaped fields, and a carousel whose children
+    /// carry `"code": null` while the parent holds the code.
+    const GRAPHQL_FEED: &[u8] = br#"{
+      "data": {
+        "xdt_api__v1__feed__user_timeline_graphql_connection": {
+          "edges": [
+            {"node": {
+               "code": "DcjKbIJyVs3",
+               "taken_at": 1787846425,
+               "media_type": 2,
+               "caption": {"text": "game, set, algo"},
+               "image_versions2": {"candidates": [
+                 {"url": "https://cdn/x_1152.jpg", "width": 1152, "height": 2048},
+                 {"url": "https://cdn/x_640.jpg", "width": 640, "height": 1138}
+               ]}
+             }, "cursor": ""},
+            {"node": {
+               "code": "DcgYclUEV18",
+               "taken_at": 1787752983,
+               "media_type": 8,
+               "carousel_media_count": 4,
+               "carousel_media": [
+                 {"code": null, "media_type": 1, "carousel_parent_id": "3972282388667522428_25025320"},
+                 {"code": null, "media_type": 1, "carousel_parent_id": "3972282388667522428_25025320"}
+               ],
+               "image_versions2": {"candidates": [
+                 {"url": "https://cdn/y_2160.jpg", "width": 2160, "height": 2700}
+               ]}
+             }, "cursor": ""}
           ],
-          "more_available": true,
-          "next_max_id": "cursor123"
-        }"#;
-        let page = parse_user_feed(raw).unwrap();
-        assert_eq!(page.raw_count, 3);
+          "page_info": {
+            "end_cursor": "3961559603594599528_25025320",
+            "has_next_page": true,
+            "has_previous_page": false,
+            "start_cursor": null
+          }
+        },
+        "xdt_viewer": {"user": {"id": "1018933991"}}
+      },
+      "status": "ok"
+    }"#;
+
+    #[test]
+    fn graphql_feed_reuses_mobile_node_extraction() {
+        let page = parse_graphql_feed(GRAPHQL_FEED).unwrap();
+        assert_eq!(page.raw_count, 2);
         assert_eq!(page.posts.len(), 2);
-        assert!(page.more_available);
-        assert_eq!(page.next_max_id, "cursor123");
 
-        let a = &page.posts[0];
-        assert_eq!(a.shortcode, "AAA");
-        assert_eq!(a.is_video, Some(true));
-        assert_eq!(a.caption.as_deref(), Some("vid"));
-        assert_eq!(a.display_url.as_deref(), Some("https://x/big.jpg"));
-
-        let b = &page.posts[1];
-        assert_eq!(b.shortcode, "BBB");
-        assert_eq!(b.is_video, None);
-        assert_eq!(b.display_url.as_deref(), Some("https://x/c.jpg"));
+        let video = &page.posts[0];
+        assert_eq!(video.shortcode, "DcjKbIJyVs3");
+        assert_eq!(video.taken_at_unix, Some(1787846425));
+        assert_eq!(video.is_video, Some(true));
+        assert_eq!(video.caption.as_deref(), Some("game, set, algo"));
+        assert_eq!(video.display_url.as_deref(), Some("https://cdn/x_1152.jpg"));
     }
 
     #[test]
-    fn media_flags_from_feed() {
-        let raw = br#"{
-          "items": [
-            {"code": "IMG", "media_type": 1,
-             "image_versions2": {"candidates": [{"url": "https://x/i.jpg", "width": 640}]}},
-            {"code": "VID", "media_type": 2,
-             "image_versions2": {"candidates": [{"url": "https://x/v.jpg", "width": 640}]}},
-            {"code": "CAR", "media_type": 8, "carousel_media": [
-              {"code": "CAR", "media_type": 1, "image_versions2": {"candidates": [{"url": "https://x/1.jpg", "width": 640}]}},
-              {"code": "CAR", "media_type": 2, "image_versions2": {"candidates": [{"url": "https://x/2.jpg", "width": 640}]}},
-              {"code": "CAR", "media_type": 1, "image_versions2": {"candidates": [{"url": "https://x/3.jpg", "width": 640}]}}
-            ]}
-          ],
-          "more_available": false,
-          "next_max_id": ""
-        }"#;
-        let page = parse_user_feed(raw).unwrap();
-        assert_eq!(page.posts.len(), 3);
-
-        let img = &page.posts[0];
-        assert_eq!(img.media_count, Some(1));
-        assert_eq!(img.is_carousel, None);
-        assert_eq!(img.has_video, None);
-
-        let vid = &page.posts[1];
-        assert_eq!(vid.media_count, Some(1));
-        assert_eq!(vid.is_carousel, None);
-        assert_eq!(vid.has_video, Some(true));
-        assert_eq!(vid.is_video, Some(true));
-
-        let car = &page.posts[2];
-        assert_eq!(car.media_count, Some(3));
-        assert_eq!(car.is_carousel, Some(true));
-        assert_eq!(car.has_video, Some(true));
+    fn graphql_feed_reads_code_from_carousel_parent_not_children() {
+        // Inverted from the mobile feed: children have "code": null here, so
+        // the parent's code is the only source.
+        let page = parse_graphql_feed(GRAPHQL_FEED).unwrap();
+        let carousel = &page.posts[1];
+        assert_eq!(carousel.shortcode, "DcgYclUEV18");
+        assert_eq!(carousel.is_carousel, Some(true));
+        assert_eq!(carousel.media_count, Some(2));
     }
 
     #[test]
-    fn media_flags_from_graphql() {
-        let raw = br#"{
-          "data": {"user": {
-            "id": "1", "username": "u",
-            "edge_followed_by": {"count": 0}, "edge_follow": {"count": 0},
-            "edge_owner_to_timeline_media": {"count": 3, "edges": [
-              {"node": {"shortcode": "IMG", "is_video": false}},
-              {"node": {"shortcode": "VID", "is_video": true}},
-              {"node": {"shortcode": "CAR", "is_video": false,
-                "edge_sidecar_to_children": {"edges": [
-                  {"node": {"is_video": false}},
-                  {"node": {"is_video": true}}
-                ]}}}
-            ]}
-          }}
-        }"#;
-        let p = parse_web_profile_info("u", raw).unwrap();
-        let posts = p.result.unwrap().recent_posts.unwrap();
-        assert_eq!(posts.len(), 3);
+    fn graphql_feed_maps_page_info_to_cursor() {
+        let page = parse_graphql_feed(GRAPHQL_FEED).unwrap();
+        assert_eq!(page.next_cursor, "3961559603594599528_25025320");
+        assert!(page.has_more);
+    }
 
-        assert_eq!(posts[0].media_count, Some(1));
-        assert_eq!(posts[0].is_carousel, None);
-        assert_eq!(posts[0].has_video, None);
+    #[test]
+    fn graphql_feed_survives_connection_rename() {
+        let raw = br#"{"data": {"xdt_api__v1__feed__renamed_tomorrow": {
+            "edges": [{"node": {"code": "ABC", "taken_at": 100}}],
+            "page_info": {"end_cursor": "c1", "has_next_page": false}
+        }}}"#;
+        let page = parse_graphql_feed(raw).unwrap();
+        assert_eq!(page.posts.len(), 1);
+        assert_eq!(page.next_cursor, "c1");
+        assert!(!page.has_more);
+    }
 
-        assert_eq!(posts[1].media_count, Some(1));
-        assert_eq!(posts[1].has_video, Some(true));
+    #[test]
+    fn graphql_feed_surfaces_errors_block() {
+        let raw = br#"{"errors": [{"message": "PersistedQueryNotFound"}], "data": null}"#;
+        let err = parse_graphql_feed(raw).unwrap_err().to_string();
+        assert!(err.contains("PersistedQueryNotFound"), "got {err}");
+    }
 
-        assert_eq!(posts[2].media_count, Some(2));
-        assert_eq!(posts[2].is_carousel, Some(true));
-        assert_eq!(posts[2].has_video, Some(true));
+    #[test]
+    fn graphql_feed_empty_last_page_stops_pagination() {
+        let raw = br#"{"data": {"xdt_api__v1__feed__user_timeline_graphql_connection": {
+            "edges": [],
+            "page_info": {"end_cursor": null, "has_next_page": false}
+        }}}"#;
+        let page = parse_graphql_feed(raw).unwrap();
+        assert!(page.posts.is_empty());
+        assert!(page.next_cursor.is_empty());
+        assert!(!page.has_more);
+    }
+
+    // --- GraphQL profile header ----------------------------------------------
+
+    #[test]
+    fn graphql_profile_reads_flat_counts() {
+        let raw = br#"{"data": {"xdt_user_by_username": {
+            "pk": "25025320",
+            "username": "instagram",
+            "full_name": "Instagram",
+            "biography": "Discovering and telling stories",
+            "is_private": false,
+            "follower_count": 695000000,
+            "following_count": 176,
+            "media_count": 8021
+        }}}"#;
+        let p = parse_graphql_profile("instagram", raw).unwrap();
+        let r = p.result.unwrap();
+        assert_eq!(r.user_id, "25025320");
+        assert_eq!(r.full_name.as_deref(), Some("Instagram"));
+        assert_eq!(r.followers, Some(695000000));
+        assert_eq!(r.following, Some(176));
+        assert_eq!(r.posts, Some(8021));
+        assert_eq!(r.is_private, Some(false));
+        assert!(p.missing.is_empty(), "missing {:?}", p.missing);
+    }
+
+    #[test]
+    fn graphql_profile_reads_nested_edge_counts() {
+        let raw = br#"{"data": {"user": {
+            "id": 25025320,
+            "username": "instagram",
+            "full_name": "Instagram",
+            "biography": "bio",
+            "edge_followed_by": {"count": 12},
+            "edge_follow": {"count": 3},
+            "edge_owner_to_timeline_media": {"count": 7}
+        }}}"#;
+        let r = parse_graphql_profile("instagram", raw)
+            .unwrap()
+            .result
+            .unwrap();
+        assert_eq!(r.user_id, "25025320");
+        assert_eq!(r.followers, Some(12));
+        assert_eq!(r.following, Some(3));
+        assert_eq!(r.posts, Some(7));
+    }
+
+    #[test]
+    fn graphql_profile_reports_missing_fields_as_drift() {
+        // Passes the identity guard (right username, has counts) but has lost
+        // biography and following_count — the drift this alert exists for.
+        let raw = br#"{"data": {"user": {
+            "username": "x", "full_name": "X", "follower_count": 5, "media_count": 7
+        }}}"#;
+        let p = parse_graphql_profile("x", raw).unwrap();
+        assert!(p.missing.contains(&"biography".to_string()));
+        assert!(p.missing.contains(&"following_count".to_string()));
+        assert!(!p.missing.contains(&"username".to_string()));
+        assert!(!p.missing.contains(&"follower_count".to_string()));
+    }
+
+    #[test]
+    fn graphql_profile_prefers_header_over_embedded_post_stubs() {
+        // The posts feed embeds a per-node `user` stub. The header object has
+        // strictly more expected fields and must win.
+        let raw = br#"{"data": {
+            "conn": {"edges": [{"node": {"user": {
+                "username": "instagram", "full_name": "Instagram", "pk": "25025320"
+            }}}]},
+            "header": {
+                "username": "instagram", "full_name": "Instagram",
+                "biography": "real one", "follower_count": 5,
+                "following_count": 6, "media_count": 7, "pk": "25025320"
+            }
+        }}"#;
+        let r = parse_graphql_profile("instagram", raw)
+            .unwrap()
+            .result
+            .unwrap();
+        assert_eq!(r.biography.as_deref(), Some("real one"));
+        assert_eq!(r.followers, Some(5));
     }
 
     #[test]
