@@ -1,0 +1,19 @@
+[Unit]
+Description=instagrab daily scan (randomized start, done by ~08:00)
+
+[Timer]
+# A full-list scan takes ~8.5h, dominated by the inter-profile jitter. To have
+# results ready by ~08:00 it must start the evening before: an 8.5h run can't
+# finish by 8am from any morning start (08:00 - 8.5h = 23:30 the night before).
+#
+#   19:30 base + up to 4h random delay = latest start 23:30, + ~8.5h ≈ 08:00.
+#
+# The base is 04:00 minus your real runtime. If your scan is longer or shorter,
+# shift OnCalendar by that difference; measure runtime from a run's journal
+# (journalctl -u instagrab -o short-unix, last timestamp minus first).
+OnCalendar=*-*-* 19:30:00
+RandomizedDelaySec=4h
+Persistent=true
+
+[Install]
+WantedBy=timers.target

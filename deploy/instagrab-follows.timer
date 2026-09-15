@@ -1,0 +1,14 @@
+[Unit]
+Description=instagrab follows refresh (Sun + Fri, randomized)
+
+[Timer]
+# Twice weekly at different times, both in the daytime gap while the overnight
+# scan (19:30-08:00) is not running — the two share one Chrome with no locking.
+# --fetch-follows finishes in minutes, so the exact daytime slot is not tight.
+OnCalendar=Sun *-*-* 13:00:00
+OnCalendar=Fri *-*-* 15:00:00
+RandomizedDelaySec=15min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,17 @@
+[Unit]
+Description=instagrab daily scan
+# Chrome is long-lived and enabled on its own; this is ordering plus a nudge to
+# start it if it somehow isn't up. Deliberately Wants=, not Requires=: if Chrome
+# is down, instagrab exits 4 (browser unreachable) and says so in the journal,
+# which is the designed behavior rather than a masked failure.
+After=chrome.service network-online.target
+Wants=chrome.service
+
+[Service]
+Type=oneshot
+User=instagrab
+Group=instagrab
+ExecStart=/usr/local/bin/instagrab --config /etc/instagrab/config.toml
+# Output goes to the journal (journalctl -u instagrab). There is no logfile to
+# create or keep writable — sidestepping the redirect-permission trap a cron
+# entry has, and one reason this is a timer.

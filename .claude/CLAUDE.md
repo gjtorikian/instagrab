@@ -7,7 +7,7 @@ captures the non-obvious context an agent needs on top of that.
 
 A Rust CLI that scrapes Instagram profile metadata by attaching to a
 long-lived headless Chrome over CDP (the `headless_chrome` crate). One JSONL
-line per username per run. Designed for cron on a server the user owns;
+line per username per run. Designed to run on a schedule (systemd timers) on a server the user owns;
 conservative defaults because IG's ToS prohibits this and the cookie jar is a
 real account.
 
@@ -23,7 +23,8 @@ src/parse.rs       GraphQL profile / posts JSON → ScrapeResult, window
 src/images.rs      plain-HTTPS download of display_url, idempotent
 src/output.rs      append-only JSONL writer + Alert struct
 src/shutdown.rs    SIGINT/SIGTERM flag checked at operation boundaries
-deploy/            systemd unit, cron entry, Linux host bootstrap docs
+deploy/            systemd units (Chrome service + scan/follows timers),
+                   Linux host bootstrap docs
 scripts/           fmt, build (build+test), release (cross-compile),
                    grab (local one-shot), chrome-launch (dev Chrome)
 ```
@@ -97,7 +98,7 @@ Things that look wrong or removable until you know why:
   a too-short idle timeout drops the connection between profiles.
 - **JSONL is append-only.** Alerts are interleaved as `event: "alert"` lines
   alongside result lines; downstream readers must tolerate both shapes.
-- **Exit codes are part of the contract** (cron + alerting key off them):
+- **Exit codes are part of the contract** (the timers + alerting key off them):
   0 OK, 1 config, 2 logged*out, 3 schema_drift, 4 browser, 5 canary_failed.
   See the `EXIT*\*`consts in`src/main.rs`.
 

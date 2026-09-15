@@ -1,0 +1,10 @@
+[Unit]
+Description=instagrab monthly follows refresh
+After=chrome.service network-online.target
+Wants=chrome.service
+
+[Service]
+Type=oneshot
+User=instagrab
+Group=instagrab
+ExecStart=/usr/local/bin/instagrab --config /etc/instagrab/config.toml --fetch-follows

@@ -1,8 +1,8 @@
 # Deploying instagrab to a Linux host
 
 A long-lived headless Chrome (systemd unit) holds the
-authenticated Instagram session in a persistent profile dir; cron invokes the
-`instagrab` binary daily to attach over CDP and append JSONL.
+authenticated Instagram session in a persistent profile dir; a systemd timer
+invokes the `instagrab` binary daily to attach over CDP and append JSONL.
 
 ## 1. Provision the host
 
@@ -12,14 +12,8 @@ process runs.
 ```sh
 # As root on the host:
 adduser --system --group --home /var/lib/instagrab instagrab
-mkdir -p /var/lib/instagrab/CDPProfile /var/log
+mkdir -p /var/lib/instagrab/CDPProfile
 chown -R instagrab:instagrab /var/lib/instagrab
-
-# Cron appends each run's output to this log AS the instagrab user, which
-# cannot create a file in root-owned /var/log itself. Create it now, owned by
-# instagrab — otherwise the `>>` redirect fails and cron's shell aborts before
-# the binary ever runs (the job "fires" in the journal but does nothing).
-install -m 0644 -o instagrab -g instagrab /dev/null /var/log/instagrab.log
 
 # Chrome
 apt-get update
@@ -88,7 +82,7 @@ Two caveats:
 - **RAM.** The release profile sets `lto = true`; linking can OOM on the ~1 GB
   host sized in step 1. Add swap first, or stay on the cross-compiled binary.
 - **`deploy/` files.** `cargo install` puts only the binary on the host, not
-  `chrome.service` or `instagrab.cron`. Steps 3 and 5 give the fetch commands.
+  the systemd units. Steps 3 and 5 give the fetch commands.
 
 Pin a version with `--version 0.2.0`; upgrade later by re-running the
 `cargo install` with `--force`.
@@ -132,7 +126,7 @@ still match step 1 (`instagrab`, `/var/lib/instagrab/CDPProfile`), and that
 
 The host's IP is new to Instagram. Doing the login _on the host_ means
 cookies are minted from that IP, and IG's first-login flag fires now (during
-bootstrap) instead of during a cron run.
+bootstrap) instead of during a scheduled run.
 
 1. From your laptop, open an SSH tunnel:
 
@@ -168,50 +162,77 @@ sudo -u instagrab /usr/local/bin/instagrab \
 tail -1 /var/lib/instagrab/runs.jsonl   # one JSON line
 ```
 
-Wire cron — from a checkout, or fetched if you installed from crates.io:
+Two timers do the scheduling: `instagrab.timer` (the daily scan) and
+`instagrab-follows.timer` (a twice-weekly `--fetch-follows` refresh). Each drives a
+`oneshot` service that runs as the `instagrab` user and logs to the journal —
+there is no logfile to create or keep writable, and no redirect to get wrong.
+
+Install all four units — from a repo checkout on the host:
 
 ```sh
-install -m 0644 deploy/instagrab.cron /etc/cron.d/instagrab
-
-# ...or, with no checkout on the host:
-curl -fsSL -o /etc/cron.d/instagrab \
-  https://raw.githubusercontent.com/gjtorikian/instagrab/main/deploy/instagrab.cron
-chmod 0644 /etc/cron.d/instagrab
+install -m 0644 deploy/instagrab.service deploy/instagrab.timer \
+  deploy/instagrab-follows.service deploy/instagrab-follows.timer \
+  /etc/systemd/system/
 ```
 
-`cron` silently ignores anything in `/etc/cron.d` that is group- or
-world-writable, or whose last line lacks a trailing newline — so keep the mode
-at `0644` and check with `tail -c1 /etc/cron.d/instagrab | xxd`.
-
-Two entries: the daily scan (04:17) and a monthly `--fetch-follows` refresh
-(03:23 on the 1st), staggered so the two never share the one Chrome session.
-
-To rehearse the *exact* thing cron does — including the log redirect — wrap the
-command in `sh -c` run as the `instagrab` user:
+No checkout (the crates.io path) — fetch them instead:
 
 ```sh
-sudo -u instagrab sh -c \
-  '/usr/local/bin/instagrab --config /etc/instagrab/config.toml >> /var/log/instagrab.log 2>&1'
-echo "exit=$?"
+base=https://raw.githubusercontent.com/gjtorikian/instagrab/main/deploy
+for u in instagrab.service instagrab.timer \
+         instagrab-follows.service instagrab-follows.timer; do
+  curl -fsSL -o "/etc/systemd/system/$u" "$base/$u"
+  chmod 0644 "/etc/systemd/system/$u"
+done
 ```
 
-The `sh -c` matters. Cron runs an `/etc/cron.d` line through a shell already
-running as `instagrab`, so the `>>` redirect is opened as `instagrab`. If you
-instead type `sudo -u instagrab instagrab ... >> /var/log/instagrab.log`, your
-*calling* shell opens the redirect under your own user — which fails with a
-bare `Permission denied` and proves nothing about whether cron will work.
+Then enable the two timers (not the services — the timers pull those in). The
+services themselves are never enabled; only the timers are:
+
+```sh
+systemctl daemon-reload
+systemctl enable --now instagrab.timer instagrab-follows.timer
+systemctl list-timers 'instagrab*'   # shows each next (randomized) fire time
+```
+
+`enable` is what makes them survive reboots — it symlinks the timers into
+`timers.target`, which systemd re-arms on every boot. `--now` also starts them
+immediately so the schedule is live without waiting for a reboot.
+
+The daily scan starts at a random point in **19:30–23:30** and runs ~8.5h, so
+results are ready by ~08:00 (an 8.5h run can't finish by morning from a morning
+start, so it goes overnight). The follows refresh runs **Sunday ~13:00 and
+Friday ~15:00**, in the daytime gap while the scan isn't running
+(`RandomizedDelaySec` jitters each). The two never share the one Chrome session,
+and neither fires at a fixed, fingerprintable minute. `Persistent=true` runs a
+window missed while the host was off once after the next boot instead of
+skipping it. If your scan runs longer or shorter than ~8.5h, shift the daily
+timer's `OnCalendar` base (= 04:00 minus your measured runtime).
+
+To rehearse the exact thing the timer does — same binary, user, and journal —
+trigger the service by hand and watch it:
+
+```sh
+systemctl start instagrab.service          # runs the scan now, as the timer would
+journalctl -u instagrab -f                 # follow it; Ctrl-C to stop watching
+```
+
+No `sh -c` or redirect dance: systemd runs the service as `instagrab` and
+captures its output, so `systemctl start` is a faithful stand-in for a timed
+run.
 
 ## 6. Operational notes
 
 - Output: `/var/lib/instagrab/runs.jsonl` (append-only). One line per
   username per run; plus `event: "alert"` lines for `logged_out` (exit 2)
   and `schema_drift` (exit 3).
-- Logs: `/var/log/instagrab.log` (cron stdout/stderr).
-- Rotating: drop a `logrotate(8)` snippet pointing at both files, with
-  `create 0644 instagrab instagrab` (or `su root instagrab`). The runner can't
-  recreate `/var/log/instagrab.log` in root-owned `/var/log`, so a plain rotate
-  that leaves the file absent breaks the next cron run the same way a missing
-  file does — the job fires and exits without running. Nothing in instagrab
-  holds long-lived handles across runs, so rotation is otherwise safe.
-- Pause: `systemctl disable --now chrome` halts everything; cron will then
-  exit code 4 (browser unreachable) until re-enabled.
+- Logs: the journal. `journalctl -u instagrab` for the daily scan,
+  `journalctl -u instagrab-follows` for the follows refresh. journald handles
+  rotation and retention itself — no logfile to place or rotate.
+- Scheduling: `systemctl list-timers 'instagrab*'` shows the next fire time for
+  each; `journalctl -u instagrab.timer` shows past triggers. Run one off-cycle
+  with `systemctl start instagrab.service`.
+- Pause: `systemctl disable --now instagrab.timer instagrab-follows.timer`
+  stops future runs. `systemctl disable --now chrome` additionally halts the
+  browser, after which a triggered run exits code 4 (browser unreachable) until
+  it is re-enabled.
