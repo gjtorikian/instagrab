@@ -34,6 +34,7 @@ struct Flags {
     dry_run: bool,
     debug: bool,
     fetch_follows: bool,
+    capture_queries: String,
     seed: String,
     limit: i64,
 }
@@ -135,6 +136,41 @@ fn main() {
         return;
     }
 
+    if !flags.capture_queries.is_empty() {
+        match s.capture_queries(&flags.capture_queries) {
+            Ok(qs) if qs.is_empty() => {
+                logln(
+                    "no GraphQL queries captured — the page fired none, or IG changed its client",
+                );
+                process::exit(EXIT_SCHEMA_DRIFT);
+            }
+            Ok(qs) => {
+                for q in &qs {
+                    println!(
+                        "{}\n  doc_id:    {}\n  variables: {}",
+                        if q.friendly_name.is_empty() {
+                            "(unnamed)"
+                        } else {
+                            &q.friendly_name
+                        },
+                        q.doc_id,
+                        q.variables
+                    );
+                }
+                println!(
+                    "\n{} quer{} captured",
+                    qs.len(),
+                    if qs.len() == 1 { "y" } else { "ies" }
+                );
+            }
+            Err(e) => {
+                logln(&format!("capture: {e}"));
+                process::exit(EXIT_BROWSER_ERROR);
+            }
+        }
+        return;
+    }
+
     if flags.fetch_follows {
         run_fetch_follows(&s, &cfg, &flags, &mut out);
         return;
@@ -158,6 +194,9 @@ fn main() {
 
     let mut logged_out_seen = false;
     let mut drift_count = 0;
+    // Which fields went missing, deduped across profiles. Without these the
+    // alert says drift happened but not what to go fix.
+    let mut drift_missing: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut results_this_run = 0;
 
     let image_dl = Some(images::new(&cfg.images_path()));
@@ -255,6 +294,7 @@ fn main() {
             }
             if !oc.missing_schema.is_empty() {
                 drift_count += 1;
+                drift_missing.extend(oc.missing_schema.iter().cloned());
                 result.errors.push("schema_drift_partial".to_string());
             }
             let _ = out.write_json(&result);
@@ -274,6 +314,7 @@ fn main() {
     if drift_count > 0 && drift_count == results_this_run {
         let mut alert = new_alert("schema_drift");
         alert.note = format!("expected paths missing on {drift_count}/{results_this_run} profiles");
+        alert.missing = drift_missing.into_iter().collect();
         let _ = out.write_json(&alert);
     }
 
@@ -376,6 +417,7 @@ fn parse_flags() -> Result<Flags, String> {
         config_path: "/etc/instagrab/config.toml".to_string(),
         one_shot: String::new(),
         write_sample: String::new(),
+        capture_queries: String::new(),
         dry_run: false,
         debug: false,
         fetch_follows: false,
@@ -422,6 +464,7 @@ fn parse_flags() -> Result<Flags, String> {
             "dry-run" => flags.dry_run = parse_bool_flag(inline_val.as_deref())?,
             "debug" => flags.debug = parse_bool_flag(inline_val.as_deref())?,
             "fetch-follows" => flags.fetch_follows = parse_bool_flag(inline_val.as_deref())?,
+            "capture-queries" => flags.capture_queries = take_value(&mut i)?,
             "seed" => flags.seed = take_value(&mut i)?,
             "limit" => {
                 let v = take_value(&mut i)?;
@@ -463,6 +506,8 @@ fn usage() -> String {
      \x20\x20\x20\x20load config and connect to Chrome but don't scrape\n\
      \x20 --fetch-follows\n\
      \x20\x20\x20\x20page seed_username's Following, (re)write the follows file, then exit\n\
+     \x20 --capture-queries string\n\
+     \x20\x20\x20\x20load USERNAME's profile, print the GraphQL queries its page fired, then exit\n\
      \x20 --seed string\n\
      \x20\x20\x20\x20seed profile for --fetch-follows (overrides config seed_username)\n\
      \x20 --once string\n\
