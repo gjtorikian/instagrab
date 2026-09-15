@@ -1,30 +1,45 @@
 # instagrab config
+#
+# Two commands share this file:
+#   instagrab --fetch-follows  -> page seed_username's Following, merge into friends.txt (run rarely, e.g. monthly)
+#   instagrab                  -> scan everyone in friends.txt, write runs.jsonl + images (run daily)
 
 # CDP endpoint of the long-lived Chrome service.
 browser_url = "http://127.0.0.1:9222"
 
-# JSONL file. Each run appends one line per username plus any alert lines.
-output_path = "/var/lib/instagrab/runs.jsonl"
+# The one output directory. instagrab writes everything under it — point your UI here:
+#   <output_path>/runs.jsonl                     scan output (one JSON line per profile)
+#   <output_path>/images/<user>/<shortcode>.jpg  first image per in-window post
+#   <output_path>/friends.txt                    the follows list (--fetch-follows merges, scan reads)
+output_path = "/var/lib/instagrab"
 
+# friends.txt is hand-editable and survives a harvest: --fetch-follows merges
+# into it rather than overwriting. Comment a username out to keep following them
+# without scanning them. Names you no longer follow are dropped -- but only when
+# the harvest came back whole, never off a truncated one.
+
+# Seed profile whose Following `instagrab --fetch-follows` pages (or pass --seed <name>).
+# Fetching the list touches Instagram's friendship endpoint, so run it rarely.
+seed_username = "your_handle"
+
+# Only keep posts whose timestamp falls within the last N days (0 = no filter).
+# With time_window_days > 0, the scan also pages the feed until the oldest
+# captured post is older than the window.
+time_window_days = 90
+
+# --- Anti-detection / tuning (defaults shown; usually leave these) ---
 # Per-run sleep between profiles, in seconds (uniform random in [min, max]).
 jitter_min_secs = 30
 jitter_max_secs = 75
-
-# Per-username navigation/wait budget.
+# Per-profile navigation/wait budget.
 nav_timeout_sec = 20
-
-# Only keep recent_posts whose taken_at_timestamp falls within the last N days.
-# 0 disables the filter. With time_window_days > 0, instagrab also paginates
-# (scrolls the profile grid) past the initial 12 posts until the oldest
-# captured post is older than the window.
-time_window_days = 7
-
-# Safety cap on pagination scrolls per profile. Each iteration is ~2.5s.
+# Safety cap on feed pages per profile.
 max_scrolls = 8
 
-# If set, download each kept post's display_url to <images_dir>/<username>/<shortcode>.jpg.
-# Idempotent: existing files are kept. Empty string disables image download.
-images_dir = "./images"
+# A canary scrape against instagram.com/instagram runs before each scan. Zero
+# posts without a logged_out signal emits a "canary_failed" alert and exits 5.
+# Always on; no knob.
 
-# Profiles to scrape. Leading @ is allowed and stripped.
-usernames = ["inch.press"]
+# Fixed scrape list, used only as a fallback when the follows file is empty.
+# Leading @ is allowed and stripped. For the follows-list workflow, leave empty.
+# usernames = ["gjtorikian"]

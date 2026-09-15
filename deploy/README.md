@@ -15,6 +15,12 @@ adduser --system --group --home /var/lib/instagrab instagrab
 mkdir -p /var/lib/instagrab/CDPProfile /var/log
 chown -R instagrab:instagrab /var/lib/instagrab
 
+# Cron appends each run's output to this log AS the instagrab user, which
+# cannot create a file in root-owned /var/log itself. Create it now, owned by
+# instagrab — otherwise the `>>` redirect fails and cron's shell aborts before
+# the binary ever runs (the job "fires" in the journal but does nothing).
+install -m 0644 -o instagrab -g instagrab /dev/null /var/log/instagrab.log
+
 # Chrome
 apt-get update
 apt-get install -y wget gnupg
@@ -180,13 +186,32 @@ at `0644` and check with `tail -c1 /etc/cron.d/instagrab | xxd`.
 Two entries: the daily scan (04:17) and a monthly `--fetch-follows` refresh
 (03:23 on the 1st), staggered so the two never share the one Chrome session.
 
+To rehearse the *exact* thing cron does — including the log redirect — wrap the
+command in `sh -c` run as the `instagrab` user:
+
+```sh
+sudo -u instagrab sh -c \
+  '/usr/local/bin/instagrab --config /etc/instagrab/config.toml >> /var/log/instagrab.log 2>&1'
+echo "exit=$?"
+```
+
+The `sh -c` matters. Cron runs an `/etc/cron.d` line through a shell already
+running as `instagrab`, so the `>>` redirect is opened as `instagrab`. If you
+instead type `sudo -u instagrab instagrab ... >> /var/log/instagrab.log`, your
+*calling* shell opens the redirect under your own user — which fails with a
+bare `Permission denied` and proves nothing about whether cron will work.
+
 ## 6. Operational notes
 
 - Output: `/var/lib/instagrab/runs.jsonl` (append-only). One line per
   username per run; plus `event: "alert"` lines for `logged_out` (exit 2)
   and `schema_drift` (exit 3).
 - Logs: `/var/log/instagrab.log` (cron stdout/stderr).
-- Rotating: drop a `logrotate(8)` snippet pointing at both files; nothing
-  in instagrab opens long-lived handles to them across runs.
+- Rotating: drop a `logrotate(8)` snippet pointing at both files, with
+  `create 0644 instagrab instagrab` (or `su root instagrab`). The runner can't
+  recreate `/var/log/instagrab.log` in root-owned `/var/log`, so a plain rotate
+  that leaves the file absent breaks the next cron run the same way a missing
+  file does — the job fires and exits without running. Nothing in instagrab
+  holds long-lived handles across runs, so rotation is otherwise safe.
 - Pause: `systemctl disable --now chrome` halts everything; cron will then
   exit code 4 (browser unreachable) until re-enabled.
