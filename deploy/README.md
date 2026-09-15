@@ -26,6 +26,8 @@ apt-get update && apt-get install -y google-chrome-stable
 
 ## 2. Install the binary and config
 
+### From a local cross-compile (default)
+
 Build locally. `scripts/release` produces a stripped, static (musl) binary so
 there's no libc dependency on the host. It uses
 [`cargo-zigbuild`](https://github.com/rust-cross/cargo-zigbuild) — no Docker
@@ -47,6 +49,51 @@ install -d -o instagrab -g instagrab /etc/instagrab
 install -m 0644 -o instagrab -g instagrab /tmp/config.toml /etc/instagrab/config.toml
 vi /etc/instagrab/config.toml   # add real config
 ```
+
+### Alternative: install from crates.io
+
+`instagrab` is published, so the host can build it itself and skip the
+cross-compile and `scp` above. The trade-off: this needs a Rust toolchain on
+the host and compiles there, where the static musl binary needs neither.
+
+```sh
+# On the host:
+sudo apt-get install -y build-essential pkg-config
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+. "$HOME/.cargo/env"
+
+# --root /usr/local lands it at /usr/local/bin/instagrab, as above
+cargo install instagrab --locked --root /usr/local
+```
+
+`cargo install` installs only the binary, so there's no `config.example.toml`
+to copy over — have the binary write its own:
+
+```sh
+install -d -o instagrab -g instagrab /etc/instagrab
+/usr/local/bin/instagrab --write-sample-config /etc/instagrab/config.toml
+chown instagrab:instagrab /etc/instagrab/config.toml
+chmod 0644 /etc/instagrab/config.toml
+vi /etc/instagrab/config.toml   # add real config
+```
+
+Two caveats:
+
+- **RAM.** The release profile sets `lto = true`; linking can OOM on the ~1 GB
+  host sized in step 1. Add swap first, or stay on the cross-compiled binary.
+- **`deploy/` files.** Steps 3 and 5 `install` `chrome.service` and
+  `instagrab.cron` from this repo, which a crates.io install doesn't put on the
+  host. Fetch those two directly instead of cloning:
+
+  ```sh
+  curl -fsSL -o /etc/systemd/system/chrome.service \
+    https://raw.githubusercontent.com/gjtorikian/instagrab/main/deploy/chrome.service
+  curl -fsSL -o /etc/cron.d/instagrab \
+    https://raw.githubusercontent.com/gjtorikian/instagrab/main/deploy/instagrab.cron
+  ```
+
+Pin a version with `--version 0.2.0`; upgrade later by re-running the
+`cargo install` with `--force`.
 
 ## 3. Install the systemd unit
 
