@@ -90,6 +90,10 @@ pub struct ScrapeResult {
     pub followers: Option<i64>,
     pub following: Option<i64>,
     pub posts: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_pic_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_pic_path: Option<String>,
     pub recent_posts: Option<Vec<RecentPost>>,
     #[serde(skip_serializing_if = "is_zero")]
     pub window_days: i64,
@@ -112,6 +116,8 @@ impl ScrapeResult {
             followers: None,
             following: None,
             posts: None,
+            profile_pic_url: None,
+            profile_pic_path: None,
             recent_posts: None,
             window_days: 0,
             window_maybe_truncated: false,
@@ -456,15 +462,23 @@ pub struct HtmlProfile {
     pub following: Option<i64>,
     pub posts: Option<i64>,
     pub is_private: Option<bool>,
+    pub profile_pic_url: Option<String>,
 }
 
 pub fn profile_fields_from_html(username: &str, html: &str) -> HtmlProfile {
     let mut out = HtmlProfile::default();
 
+    // Whether a handle-bearing tag confirmed this is the profile we asked for.
+    // og:image carries no handle of its own, so it is trusted only once this is
+    // set — the same "attribute nothing to an account that didn't name itself"
+    // rule the rest of the parser follows.
+    let mut confirmed = false;
+
     if let Some(desc) = meta_content(html, "og:description")
         .or_else(|| meta_content(html, "description"))
         .filter(|d| mentions_handle(d, username))
     {
+        confirmed = true;
         if let Some(caps) = counts_re().captures(&desc) {
             out.followers = parse_abbreviated_count(caps.get(1).map_or("", |m| m.as_str()));
             out.following = parse_abbreviated_count(caps.get(2).map_or("", |m| m.as_str()));
@@ -474,12 +488,18 @@ pub fn profile_fields_from_html(username: &str, html: &str) -> HtmlProfile {
 
     // "Instagram (@instagram) • Instagram photos and videos"
     if let Some(title) = meta_content(html, "og:title").filter(|t| mentions_handle(t, username)) {
+        confirmed = true;
         if let Some((name, _)) = title.split_once(" (@") {
             let name = name.trim();
             if !name.is_empty() {
                 out.full_name = Some(name.to_string());
             }
         }
+    }
+
+    // og:image on a profile page is the avatar.
+    if confirmed {
+        out.profile_pic_url = meta_content(html, "og:image").filter(|u| !u.is_empty());
     }
 
     if html.contains("This Account is Private") || html.contains("This account is private") {
@@ -633,6 +653,10 @@ pub fn parse_graphql_profile(username: &str, raw: &[u8]) -> AnyResult<ParsedProf
         .and_then(Value::as_str)
         .map(String::from);
     r.is_private = user.get("is_private").and_then(Value::as_bool);
+    r.profile_pic_url = nav(user, &["hd_profile_pic_url_info", "url"])
+        .and_then(Value::as_str)
+        .or_else(|| user.get("profile_pic_url").and_then(Value::as_str))
+        .map(String::from);
     r.followers = profile_count(user, &["follower_count", "edge_followed_by"]);
     r.following = profile_count(user, &["following_count", "edge_follow"]);
     r.posts = profile_count(user, &["media_count", "edge_owner_to_timeline_media"]);
@@ -849,6 +873,45 @@ mod tests {
         assert_eq!(p.following, Some(176));
         assert_eq!(p.posts, Some(8021));
         assert_eq!(p.full_name.as_deref(), Some("Instagram"));
+    }
+
+    #[test]
+    fn og_image_becomes_profile_pic_when_handle_confirmed() {
+        let html = r#"<meta property="og:title" content="Instagram (@instagram) &bull; photos" />
+        <meta property="og:image" content="https://scontent.cdninstagram.com/avatar_instagram.jpg" />
+        <meta property="og:description" content="695M Followers, 176 Following, 8,021 Posts - See Instagram photos and videos from Instagram (@instagram)" />"#;
+        let p = profile_fields_from_html("instagram", html);
+        assert_eq!(
+            p.profile_pic_url.as_deref(),
+            Some("https://scontent.cdninstagram.com/avatar_instagram.jpg")
+        );
+    }
+
+    #[test]
+    fn og_image_ignored_when_no_tag_confirmed_the_handle() {
+        // Wrong page: og:image has no handle of its own, so without a confirming
+        // og:title/og:description it must not be attributed to us.
+        let html = r#"<meta property="og:image" content="https://cdn/someone_else.jpg" />
+        <meta property="og:description" content="1 Followers, 2 Following, 3 Posts - See Instagram photos and videos from Someone (@someoneelse)" />"#;
+        assert_eq!(
+            profile_fields_from_html("instagram", html),
+            HtmlProfile::default()
+        );
+    }
+
+    #[test]
+    fn graphql_profile_captures_hd_avatar() {
+        let raw = br#"{"data": {"user": {
+            "username": "instagram", "full_name": "Instagram",
+            "follower_count": 5, "following_count": 6, "media_count": 7,
+            "profile_pic_url": "https://cdn/small.jpg",
+            "hd_profile_pic_url_info": {"url": "https://cdn/hd.jpg"}
+        }}}"#;
+        let r = parse_graphql_profile("instagram", raw)
+            .unwrap()
+            .result
+            .unwrap();
+        assert_eq!(r.profile_pic_url.as_deref(), Some("https://cdn/hd.jpg"));
     }
 
     #[test]

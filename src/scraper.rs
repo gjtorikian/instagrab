@@ -538,6 +538,7 @@ impl Scraper {
         result.following = meta.following;
         result.posts = meta.posts;
         result.is_private = meta.is_private;
+        result.profile_pic_url = meta.profile_pic_url;
 
         if result.followers.is_none() && result.posts.is_none() {
             match &profile_q {
@@ -585,6 +586,9 @@ impl Scraper {
                                     result.followers = r.followers;
                                     result.following = r.following;
                                     result.posts = r.posts;
+                                    if result.profile_pic_url.is_none() {
+                                        result.profile_pic_url = r.profile_pic_url;
+                                    }
                                 }
                             }
                             Err(e) => result.errors.push(format!("profile_parse: {e}")),
