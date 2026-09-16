@@ -33,15 +33,37 @@ impl Downloader {
         if self.dir.is_empty() {
             return;
         }
-        let posts = match &mut r.recent_posts {
-            Some(p) if !p.is_empty() => p,
-            _ => return,
-        };
+        let has_posts = r.recent_posts.as_ref().is_some_and(|p| !p.is_empty());
+        let has_avatar = r.profile_pic_url.as_deref().is_some_and(|u| !u.is_empty());
+        if !has_posts && !has_avatar {
+            return;
+        }
         let udir = Path::new(&self.dir).join(&r.username);
         if let Err(e) = fs::create_dir_all(&udir) {
             r.errors.push(format!("images_mkdir: {e}"));
             return;
         }
+
+        // Profile picture. Overwritten every run, not kept like post images: a
+        // post is immutable per shortcode, but an avatar changes, so a
+        // keep-existing rule would pin the stale one. fetch_one writes a temp
+        // and renames, so the swap is atomic.
+        if has_avatar {
+            if shutdown::requested() {
+                return;
+            }
+            let url = r.profile_pic_url.clone().unwrap_or_default();
+            let target = udir.join("profile.jpg");
+            match self.fetch_one(&url, &target) {
+                Ok(()) => r.profile_pic_path = Some(target.to_string_lossy().into_owned()),
+                Err(e) => r.errors.push(format!("profile_pic: {e}")),
+            }
+        }
+
+        let posts = match &mut r.recent_posts {
+            Some(p) if !p.is_empty() => p,
+            _ => return,
+        };
         for p in posts.iter_mut() {
             if shutdown::requested() {
                 return;
