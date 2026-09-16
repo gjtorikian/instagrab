@@ -199,15 +199,16 @@ systemctl list-timers 'instagrab*'   # shows each next (randomized) fire time
 `timers.target`, which systemd re-arms on every boot. `--now` also starts them
 immediately so the schedule is live without waiting for a reboot.
 
-The daily scan starts at a random point in **19:30–23:30** and runs ~8.5h, so
-results are ready by ~08:00 (an 8.5h run can't finish by morning from a morning
-start, so it goes overnight). The follows refresh runs **Sunday ~13:00 and
-Friday ~15:00**, in the daytime gap while the scan isn't running
-(`RandomizedDelaySec` jitters each). The two never share the one Chrome session,
-and neither fires at a fixed, fingerprintable minute. `Persistent=true` runs a
-window missed while the host was off once after the next boot instead of
-skipping it. If your scan runs longer or shorter than ~8.5h, shift the daily
-timer's `OnCalendar` base (= 04:00 minus your measured runtime).
+The daily scan starts at a random point in **18:00–22:00** and runs ~9.5h
+(measured — almost all of it inter-profile jitter), so results are ready by
+~08:00; a run that long can't finish by morning from a morning start, so it
+goes overnight. The follows refresh runs **Sunday ~13:00 and Friday ~15:00**,
+in the daytime gap while the scan isn't running (`RandomizedDelaySec` jitters
+each). The two never share the one Chrome session, and neither fires at a fixed,
+fingerprintable minute. `Persistent=true` runs a window missed while the host
+was off once after the next boot instead of skipping it. If your scan's runtime
+differs, shift the daily timer's `OnCalendar` base: `base = 08:00 − 4h −
+runtime` (18:30 for 9.5h; the shipped 18:00 buys ~30min of margin).
 
 To rehearse the exact thing the timer does — same binary, user, and journal —
 trigger the service by hand and watch it:
